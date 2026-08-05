@@ -1,0 +1,15 @@
+[package]
+name = "azbft-verifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+azbft-core = { path = "../azbft-core" }
+azbft-crypto = { path = "../azbft-crypto" }
+azbft-devnet = { path = "../azbft-devnet" }
+azbft-types = { path = "../azbft-types" }
+borsh.workspace = true
+thiserror.workspace = true

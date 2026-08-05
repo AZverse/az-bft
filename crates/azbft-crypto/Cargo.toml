@@ -1,0 +1,21 @@
+[package]
+name = "azbft-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[features]
+default = []
+host-extensions = []
+insecure-test-keys = []
+
+[dependencies]
+azbft-types = { package = "azbft-types", path = "../azbft-types" }
+borsh.workspace = true
+blake3.workspace = true
+blst.workspace = true
+k256.workspace = true
+rand_core.workspace = true
+thiserror.workspace = true

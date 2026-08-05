@@ -1,0 +1,13 @@
+[package]
+name = "azbft-safety"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+azbft-types = { package = "azbft-types", path = "../azbft-types" }
+
+[dev-dependencies]
+proptest.workspace = true

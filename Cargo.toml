@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/azbft-cli",
+    "crates/azbft-types",
+    "crates/azbft-crypto",
+    "crates/azbft-devnet",
+    "crates/azbft-core",
+    "crates/azbft-verifier",
+    "crates/azbft-safety",
+]
+
+[workspace.package]
+version = "0.1.0-alpha"
+edition = "2021"
+rust-version = "1.93"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+borsh = { version = "1", features = ["derive"] }
+blake3 = "1"
+blst = "0.3"
+k256 = { version = "0.13", features = ["ecdsa"] }
+proptest = "1"
+rand_core = "0.6"
+thiserror = "2"

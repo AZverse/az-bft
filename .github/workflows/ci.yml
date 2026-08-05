@@ -1,0 +1,59 @@
+name: Short gates
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  workspace:
+    name: Workspace and public boundary
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Rust 1.93
+        run: |
+          rustup toolchain install 1.93.0 --profile minimal --component rustfmt --component clippy
+          rustup override set 1.93.0
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Strict Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Strict Rustdoc
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+      - name: Locked workspace check
+        run: cargo check --workspace --locked
+      - name: Crypto default boundary
+        run: cargo check -p azbft-crypto --no-default-features
+      - name: Crypto opt-in feature check
+        run: cargo check -p azbft-crypto --features host-extensions,insecure-test-keys
+      - name: Crypto opt-in feature tests
+        run: cargo test -p azbft-crypto --features host-extensions,insecure-test-keys
+      - name: Locked workspace tests
+        run: cargo test --workspace --locked
+      - name: Public package gate
+        run: cargo test -p azbft-cli --test public_package
+
+  clean-clone:
+    name: Clean-clone locked check
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+      - name: Install Rust 1.93
+        run: |
+          rustup toolchain install 1.93.0 --profile minimal
+          rustup override set 1.93.0
+      - name: Clone without local hardlinks and check
+        run: |
+          git clone --no-local "$GITHUB_WORKSPACE" "$RUNNER_TEMP/az-bft-clean"
+          cd "$RUNNER_TEMP/az-bft-clean"
+          cargo check --workspace --locked

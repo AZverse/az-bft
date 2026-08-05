@@ -1,0 +1,16 @@
+[package]
+name = "azbft-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+azbft-types = { package = "azbft-types", path = "../azbft-types" }
+azbft-crypto = { package = "azbft-crypto", path = "../azbft-crypto" }
+azbft-safety = { package = "azbft-safety", path = "../azbft-safety" }
+borsh.workspace = true
+
+[dev-dependencies]
+azbft-crypto = { package = "azbft-crypto", path = "../azbft-crypto", features = ["insecure-test-keys"] }
