@@ -95,15 +95,17 @@ impl ConsensusCore {
         // before the durable commit arm has triggered that replacement.
         // Local timer commands are harmless and will be replaced by the new
         // core's start batch; network output from the old epoch is not.
-        if cmds.iter().any(
-            |command| matches!(command, Command::Commit(committed) if committed.block.reconfig.is_some()),
-        ) {
+        if cmds.iter().any(|command| {
+            matches!(
+                command,
+                Command::Commit(committed)
+                    if committed.two_chain && committed.block.reconfig.is_some()
+            )
+        }) {
             cmds.retain(|command| {
                 !matches!(
                     command,
-                    Command::Send(_, _)
-                        | Command::Broadcast(_)
-                        | Command::CreatePayload { .. }
+                    Command::Send(_, _) | Command::Broadcast(_) | Command::CreatePayload { .. }
                 )
             });
         }
@@ -300,25 +302,33 @@ impl ConsensusCore {
                 let n = chain.len();
                 for i in 0..n {
                     let block = chain[i].clone();
-                    if let Some(rc) = &block.reconfig {
-                        if let Some(jr) = &rc.jail {
-                            self.jailed.insert(jr.offender, jr.until_epoch);
-                        } else {
-                            for m in rc.next_set.members() {
-                                let id = &m.node_id;
-                                if !self.vset.contains(id) && self.jailed.contains_key(id) {
-                                    self.jailed.remove(id);
+                    // A reconfiguration proposal becomes an epoch boundary only
+                    // when this exact block is the consecutive two-chain commit
+                    // target. A timed-out attempt may later enter the durable
+                    // prefix as an ancestor of a different consecutive pair;
+                    // that linkage-level record is an inert attempt, not a second
+                    // validator-set activation.
+                    if i + 1 == n {
+                        if let Some(rc) = &block.reconfig {
+                            if let Some(jr) = &rc.jail {
+                                self.jailed.insert(jr.offender, jr.until_epoch);
+                            } else {
+                                for m in rc.next_set.members() {
+                                    let id = &m.node_id;
+                                    if !self.vset.contains(id) && self.jailed.contains_key(id) {
+                                        self.jailed.remove(id);
+                                    }
                                 }
                             }
-                        }
-                        // Consumed-evidence replay protection: record each carried equivocation proof as
-                        // consumed so the same act cannot be replayed in a later
-                        // reconfig to punish the offender twice (consumed-evidence replay protection).
-                        // Key = the act (voter, epoch, round); insert-only.
-                        // Deterministic — every node applies the same committed block.
-                        for p in &rc.evidence {
-                            let v = &p.vote_a.inner;
-                            self.consumed_evidence.insert((v.voter, v.epoch, v.round.0));
+                            // Consumed-evidence replay protection: record each carried equivocation proof as
+                            // consumed so the same act cannot be replayed in a later
+                            // reconfig to punish the offender twice (consumed-evidence replay protection).
+                            // Key = the act (voter, epoch, round); insert-only.
+                            // Deterministic — every node applies the same committed block.
+                            for p in &rc.evidence {
+                                let v = &p.vote_a.inner;
+                                self.consumed_evidence.insert((v.voter, v.epoch, v.round.0));
+                            }
                         }
                     }
                     // Commit-certificate linkage:`commit_qc` certifies
@@ -2097,6 +2107,17 @@ mod tests {
             },
             3,
         );
+        let inert = commands.iter().find_map(|command| match command {
+            Command::Commit(committed) if committed.block.id() == first_block.id() => {
+                Some(committed.two_chain)
+            }
+            _ => None,
+        });
+        assert_eq!(
+            inert,
+            Some(false),
+            "the timed-out first attempt may become durable, but it is not the active boundary"
+        );
         let exact = commands.iter().find_map(|command| match command {
             Command::Commit(committed)
                 if committed.two_chain && committed.block.id() == retry_block.id() =>
@@ -3430,8 +3451,8 @@ mod tests {
             !core.consumed_evidence().contains(&key),
             "not consumed before the commit"
         );
-        // b1 carries a removal reconfig justified by the proof; b2..b4 chain it so
-        // process_qc(commit_qc over b4) commits b1..b3.
+        // b1 carries a removal reconfig justified by the proof; its adjacent
+        // child b2 makes b1 the exact two-chain commit target.
         let rc = Reconfig {
             next_set: vset.without(&equivocator),
             evidence: vec![proof],
@@ -3460,32 +3481,10 @@ mod tests {
             author: vset.leader(Round(2)),
             reconfig: None,
         };
-        let b3 = Block {
-            header_version: BLOCK_HEADER_VERSION_V2,
-            height: 3,
-            timestamp_ms: 3,
-            epoch: 0,
-            round: Round(3),
-            parent_qc: qc_over(b2.id(), Round(2), &kps),
-            payload_hash: blake3_id(&b"reconfig-descendant-three".to_vec()),
-            author: vset.leader(Round(3)),
-            reconfig: None,
-        };
-        let b4 = Block {
-            header_version: BLOCK_HEADER_VERSION_V2,
-            height: 4,
-            timestamp_ms: 4,
-            epoch: 0,
-            round: Round(4),
-            parent_qc: qc_over(b3.id(), Round(3), &kps),
-            payload_hash: blake3_id(&b"reconfig-commit-qc-target".to_vec()),
-            author: vset.leader(Round(4)),
-            reconfig: None,
-        };
-        let commit_qc = qc_over(b4.id(), Round(4), &kps);
+        let commit_qc = qc_over(b2.id(), Round(2), &kps);
         let _ = core.handle(
             Event::SyncApply {
-                blocks: vec![b1, b2, b3, b4],
+                blocks: vec![b1, b2],
                 commit_qc,
             },
             0,
