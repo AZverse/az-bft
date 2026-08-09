@@ -89,6 +89,24 @@ impl ConsensusCore {
     pub fn handle(&mut self, ev: Event, now: LogicalTime) -> Vec<Command> {
         let before = self.safety_snapshot();
         let mut cmds = self.handle_inner(ev, now);
+        // Once this batch commits a reconfiguration, the host is about to
+        // replace this epoch's core. Do not let command reordering publish a
+        // vote, timeout, proposal, or payload request from the retired epoch
+        // before the durable commit arm has triggered that replacement.
+        // Local timer commands are harmless and will be replaced by the new
+        // core's start batch; network output from the old epoch is not.
+        if cmds.iter().any(
+            |command| matches!(command, Command::Commit(committed) if committed.block.reconfig.is_some()),
+        ) {
+            cmds.retain(|command| {
+                !matches!(
+                    command,
+                    Command::Send(_, _)
+                        | Command::Broadcast(_)
+                        | Command::CreatePayload { .. }
+                )
+            });
+        }
         // Command scheduling: execute latency-sensitive local control + network output
         // before any co-emitted durable block append. This does not weaken the durability invariant:
         // a changed safety snapshot is synchronously persisted at index 0 below,
@@ -115,19 +133,25 @@ impl ConsensusCore {
                 self.on_payload_ready(context, payload, now)
             }
             Event::RequestReconfig(set, sig) => {
-                self.pending_reconfig = Some(Reconfig {
-                    next_set: set,
-                    evidence: vec![],
-                    operator_sig: Some(sig),
-                    jail: None,
-                });
+                // A certified reconfiguration locks the transition contents.
+                // Later operator requests must wait for the next epoch rather
+                // than replace the value honest validators are retrying.
+                if self.epoch_ending_round.is_none() {
+                    self.pending_reconfig = Some(Reconfig {
+                        next_set: set,
+                        evidence: vec![],
+                        operator_sig: Some(sig),
+                        jail: None,
+                    });
+                }
                 Vec::new()
             }
             Event::RequestRemoval(x, proof) => {
                 // Operator-submitted, evidence-justified removal. Validate before
                 // staging: the target must be a current validator, the proof must
                 // name that target, and the proof must verify against the current set.
-                if self.vset.contains(&x)
+                if self.epoch_ending_round.is_none()
+                    && self.vset.contains(&x)
                     && proof.vote_a.inner.voter == x
                     && verify_equivocation_proof(&proof, &self.vset)
                 {
@@ -146,7 +170,8 @@ impl ConsensusCore {
                     self.epoch,
                     &Some(jr.clone()),
                 );
-                if self.vset.contains(&jr.offender)
+                if self.epoch_ending_round.is_none()
+                    && self.vset.contains(&jr.offender)
                     && jail_vset == self.vset.without(&jr.offender)
                     && jr.until_epoch > self.epoch
                     && verify_operator_multisig(&self.operator_set, &jail_bytes, &sig)
@@ -225,6 +250,21 @@ impl ConsensusCore {
             return false;
         }
 
+        // Inspect a known certified block before allowing the certificate to
+        // move any local safety state. Once an epoch transition is locked, a
+        // different reconfiguration must not replace it even if presented with
+        // an otherwise valid QC.
+        if let Some(reconfig) = self
+            .tree
+            .get(&qc.block_id)
+            .and_then(|block| block.reconfig.as_ref())
+        {
+            if self.epoch_ending_round.is_some() && self.pending_reconfig.as_ref() != Some(reconfig)
+            {
+                return false;
+            }
+        }
+
         // (2) adopt as high_qc if it is at least as high. `>=` (not `>`) so a
         //     QC at the same round as the current high_qc — e.g. re-derived
         //     from a fresh proposal — is idempotently kept.
@@ -242,9 +282,12 @@ impl ConsensusCore {
             // QC certifies the known reconfiguration block. Until then, retain
             // pending_reconfig so a later leader can retry the same authorized
             // request.
-            if b.reconfig.is_some() {
+            if let Some(reconfig) = &b.reconfig {
                 self.epoch_ending_round = Some(b.round);
-                self.pending_reconfig = None;
+                // Keep the certified value staged. If the immediately-adjacent
+                // child times out, an honest later leader re-emits this exact
+                // transition until an adjacent two-chain commits one attempt.
+                self.pending_reconfig = Some(reconfig.clone());
             }
             // Call `update_on_qc` once because it both raises the lock and
             // returns the commit target.
@@ -401,6 +444,9 @@ impl ConsensusCore {
             if !azbft_crypto::aggregator::verify_vset_pops(&rc.next_set) {
                 return out;
             }
+            if self.epoch_ending_round.is_some() && self.pending_reconfig.as_ref() != Some(rc) {
+                return out;
+            }
             for m in rc.next_set.members() {
                 let id = &m.node_id;
                 if !self.vset.contains(id) {
@@ -497,14 +543,19 @@ impl ConsensusCore {
             }
         }
 
-        // Anti-fork cap: once a reconfig block is certified at round R0, never
-        // vote for a block at round > R0 + 1. We still vote for its direct child
-        // (R0 + 1), the 2-chain commit vehicle; voting beyond that would let some
-        // nodes roll to epoch e+1 while others keep committing epoch-e blocks,
-        // diverging the ledger.
+        // Epoch-boundary gate: the adjacent child at R0+1 remains the preferred
+        // commit vehicle. If it times out, later rounds may progress only by
+        // re-emitting the exact certified transition. This preserves the old
+        // anti-fork property (no ordinary epoch-e tail can grow beyond the
+        // boundary) without making R0+1 a single liveness point. A QC for a
+        // retry moves `epoch_ending_round`, opening exactly one adjacent-child
+        // round for the existing two-chain ECC.
         if let Some(r0) = self.epoch_ending_round {
-            if b.round.0 > r0.0 + 1 {
-                return out; // epoch is ending: don't vote past the reconfig block's child (anti-fork)
+            if b.round.0 > r0.0 + 1
+                && (self.pending_reconfig.is_none()
+                    || b.reconfig.as_ref() != self.pending_reconfig.as_ref())
+            {
+                return out;
             }
         }
 
@@ -696,11 +747,10 @@ impl ConsensusCore {
             parent_qc: context.parent.clone(),
             payload_hash: blake3_id(&payload),
             author: self.me,
-            reconfig: if self.epoch_ending_round.is_some() {
-                None
-            } else {
-                self.pending_reconfig.clone()
-            },
+            // Before certification this carries a staged request. Afterwards
+            // it carries the immutable, certified request again so a timeout
+            // cannot permanently close the only adjacent-child window.
+            reconfig: self.pending_reconfig.clone(),
         };
         if validate_block_header_v2(&block, parent_anchor, Some(now)).is_err() {
             return out;
@@ -1802,13 +1852,30 @@ mod tests {
     // ---- (epoch-boundary safety): epoch-ending vote guard (anti-fork) ----
 
     #[test]
-    fn epoch_ending_caps_voting_past_plus_one() {
+    fn epoch_ending_rejects_ordinary_blocks_past_plus_one() {
         let (kps, vset) = validators();
         // Pick a node and drive it to a state where it WOULD vote for a round-3
         // proposal, then assert the epoch-ending guard suppresses the vote.
         let mut core = core_as(&vset, 0);
-        // Simulate "a reconfig block was certified at round 1": set the guard
-        // state directly (pub(crate)), isolating THIS cap from QC construction.
+        // Simulate "a reconfig block was certified at round 1". The locked
+        // value is deliberately present, proving an ordinary proposal cannot
+        // exploit the retry exception.
+        let next = ValidatorSet::new(
+            kps.iter()
+                .take(3)
+                .map(|k| (k.node_id(), k.pubkey_bytes(), 1u64))
+                .collect(),
+        );
+        let operator = Keypair::from_seed(999_999);
+        core.pending_reconfig = Some(Reconfig {
+            next_set: next.clone(),
+            evidence: vec![],
+            operator_sig: Some(operator.sign(
+                Domain::Reconfig,
+                &azbft_types::reconfig_signing_bytes(&next, 0),
+            )),
+            jail: None,
+        });
         core.epoch_ending_round = Some(Round(1));
 
         // Build a round-3 proposal the core would otherwise act on: author it as
@@ -1847,7 +1914,210 @@ mod tests {
             !cmds
                 .iter()
                 .any(|c| matches!(c, Command::Send(_, ConsensusMessage::Vote(_)))),
-            "after a reconfig block at R0=1, a round-3 (> R0+1) proposal must NOT be voted"
+            "after a reconfig block at R0=1, an ordinary round-3 proposal must NOT be voted"
+        );
+    }
+
+    #[test]
+    fn epoch_ending_votes_for_the_exact_locked_retry_after_timeout() {
+        let (kps, vset) = validators();
+        let mut core = core_as(&vset, 0);
+        let next = ValidatorSet::new(
+            kps.iter()
+                .take(3)
+                .map(|k| (k.node_id(), k.pubkey_bytes(), 1u64))
+                .collect(),
+        );
+        let operator = Keypair::from_seed(999_999);
+        let locked = Reconfig {
+            next_set: next.clone(),
+            evidence: vec![],
+            operator_sig: Some(operator.sign(
+                Domain::Reconfig,
+                &azbft_types::reconfig_signing_bytes(&next, 0),
+            )),
+            jail: None,
+        };
+        core.pending_reconfig = Some(locked.clone());
+        core.epoch_ending_round = Some(Round(1));
+
+        let leader3 = vset.leader(Round(3));
+        let tc2_sigs: Vec<(NodeId, Vec<u8>)> = kps
+            .iter()
+            .take(3)
+            .map(|key| {
+                (
+                    key.node_id(),
+                    key.sign(Domain::Timeout, &timeout_digest(0, Round(2)).0),
+                )
+            })
+            .collect();
+        let proposal = Proposal {
+            block: Block {
+                header_version: BLOCK_HEADER_VERSION_V2,
+                height: 1,
+                timestamp_ms: 1,
+                epoch: 0,
+                round: Round(3),
+                parent_qc: QuorumCert::genesis(),
+                payload_hash: blake3_id(&b"locked-retry".to_vec()),
+                author: leader3,
+                reconfig: Some(locked),
+            },
+            last_round_tc: Some(TimeoutCert {
+                round: Round(2),
+                agg: SecpMultiSig::aggregate(&tc2_sigs),
+                high_qc: QuorumCert::genesis(),
+            }),
+        };
+        let commands = core.handle(
+            Event::Proposal(sign_proposal(kp_of(&kps, leader3), &proposal)),
+            0,
+        );
+        assert!(
+            commands
+                .iter()
+                .any(|command| matches!(command, Command::Send(_, ConsensusMessage::Vote(_)))),
+            "the exact locked transition must remain live after the adjacent round timed out: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn timed_out_boundary_retry_produces_an_existing_wire_epoch_change_cert() {
+        let (kps, vset) = validators();
+        let me_idx = kps
+            .iter()
+            .position(|key| key.node_id() != vset.leader(Round(1)))
+            .expect("a replica exists");
+        let mut core = core_as(&vset, me_idx);
+        let next = ValidatorSet::new(
+            kps.iter()
+                .take(3)
+                .map(|key| (key.node_id(), key.pubkey_bytes(), 1u64))
+                .collect(),
+        );
+        let operator = Keypair::from_seed(999_999);
+        let locked = Reconfig {
+            next_set: next.clone(),
+            evidence: vec![],
+            operator_sig: Some(operator.sign(
+                Domain::Reconfig,
+                &azbft_types::reconfig_signing_bytes(&next, 0),
+            )),
+            jail: None,
+        };
+
+        // R1: the first transition attempt obtains a QC.
+        let first = make_reconfig_proposal(&kps, &vset, locked.clone(), b"first-boundary");
+        let first_block = first.inner.block.clone();
+        let first_delivery = core.handle(Event::Proposal(first), 1);
+        assert!(first_delivery
+            .iter()
+            .any(|command| matches!(command, Command::Send(_, ConsensusMessage::Vote(_)))));
+        let first_qc = qc_over(first_block.id(), Round(1), &kps);
+        let mut first_qc_commands = Vec::new();
+        assert!(core.process_qc(&first_qc, &mut first_qc_commands));
+        assert_eq!(core.epoch_ending_round, Some(Round(1)));
+        assert_eq!(core.pending_reconfig.as_ref(), Some(&locked));
+
+        // R2 times out. R3 is justified by TC(R2), extends QC(R1), and carries
+        // the exact same locked transition rather than an ordinary old-epoch block.
+        let _ = core.handle(Event::LocalTimeout(Round(2)), 2);
+        let timeout_signatures: Vec<(NodeId, Vec<u8>)> = kps
+            .iter()
+            .take(3)
+            .map(|key| {
+                (
+                    key.node_id(),
+                    key.sign(Domain::Timeout, &timeout_digest(0, Round(2)).0),
+                )
+            })
+            .collect();
+        let retry = Proposal {
+            block: Block {
+                header_version: BLOCK_HEADER_VERSION_V2,
+                height: 2,
+                timestamp_ms: 2,
+                epoch: 0,
+                round: Round(3),
+                parent_qc: first_qc.clone(),
+                payload_hash: blake3_id(&b"retry-boundary".to_vec()),
+                author: vset.leader(Round(3)),
+                reconfig: Some(locked.clone()),
+            },
+            last_round_tc: Some(TimeoutCert {
+                round: Round(2),
+                agg: SecpMultiSig::aggregate(&timeout_signatures),
+                high_qc: first_qc,
+            }),
+        };
+        let retry_block = retry.block.clone();
+        let retry_delivery = core.handle(
+            Event::Proposal(sign_proposal(kp_of(&kps, retry.block.author), &retry)),
+            2,
+        );
+        assert!(retry_delivery
+            .iter()
+            .any(|command| matches!(command, Command::Send(_, ConsensusMessage::Vote(_)))));
+        let retry_qc = qc_over(retry_block.id(), Round(3), &kps);
+        let mut retry_qc_commands = Vec::new();
+        assert!(core.process_qc(&retry_qc, &mut retry_qc_commands));
+        assert_eq!(core.epoch_ending_round, Some(Round(3)));
+
+        // R4 is the adjacent commit vehicle for the retry. QC(R4) commits R3
+        // through the unchanged two-chain rule. The original R1 transition is
+        // an ancestor in the same commit batch, while R3 supplies an exact ECC.
+        let child = Proposal {
+            block: Block {
+                header_version: BLOCK_HEADER_VERSION_V2,
+                height: 3,
+                timestamp_ms: 3,
+                epoch: 0,
+                round: Round(4),
+                parent_qc: retry_qc,
+                payload_hash: blake3_id(&b"retry-child".to_vec()),
+                author: vset.leader(Round(4)),
+                reconfig: Some(locked),
+            },
+            last_round_tc: None,
+        };
+        let child_block = child.block.clone();
+        let child_delivery = core.handle(
+            Event::Proposal(sign_proposal(kp_of(&kps, child.block.author), &child)),
+            3,
+        );
+        assert!(child_delivery
+            .iter()
+            .any(|command| matches!(command, Command::Send(_, ConsensusMessage::Vote(_)))));
+
+        let commands = core.handle(
+            Event::SyncApply {
+                blocks: Vec::new(),
+                commit_qc: qc_over(child_block.id(), Round(4), &kps),
+            },
+            3,
+        );
+        let exact = commands.iter().find_map(|command| match command {
+            Command::Commit(committed)
+                if committed.two_chain && committed.block.id() == retry_block.id() =>
+            {
+                Some(&committed.cert)
+            }
+            _ => None,
+        });
+        let exact = exact.expect("the retry must be the exact two-chain commit tail");
+        let ecc = EpochChangeCert {
+            reconfig_block: exact.block.clone(),
+            child_block: exact.child.clone(),
+            commit_qc: exact.commit_qc.clone(),
+        };
+        assert!(crate::verify_epoch_change_cert(&ecc, &vset, 0));
+        assert!(
+            commands.iter().all(|command| !matches!(
+                command,
+                Command::Send(_, _) | Command::Broadcast(_) | Command::CreatePayload { .. }
+            )),
+            "a batch that commits the transition must not publish old-epoch work: {commands:?}"
         );
     }
 
@@ -2034,14 +2304,15 @@ mod tests {
         let certified_qc = qc_over(reconfig_block.id(), reconfig_block.round, &kps);
         assert!(core.process_qc(&certified_qc, &mut qc_out));
         assert_eq!(core.epoch_ending_round, Some(reconfig_block.round));
-        assert!(
-            core.pending_reconfig.is_none(),
-            "certifying the known reconfiguration block must clear the pending request"
+        assert_eq!(
+            core.pending_reconfig.as_ref(),
+            reconfig_block.reconfig.as_ref(),
+            "certifying the transition must retain its exact value as the retry lock"
         );
     }
 
     #[test]
-    fn guard_suppresses_reconfig_once_epoch_is_ending() {
+    fn leader_reemits_locked_reconfig_once_epoch_is_ending() {
         let (kps, vset) = validators();
         let leader1 = vset.leader(Round(1));
         let me_idx = kps.iter().position(|k| k.node_id() == leader1).unwrap();
@@ -2066,8 +2337,8 @@ mod tests {
             Command::Broadcast(ConsensusMessage::Proposal(sp)) if sp.inner.block.reconfig.is_some())
         });
         assert!(
-            !carried,
-            "an ending epoch must not propose another reconfiguration; got {out:?}"
+            carried,
+            "an ending epoch must re-emit the locked reconfiguration until it commits; got {out:?}"
         );
     }
 

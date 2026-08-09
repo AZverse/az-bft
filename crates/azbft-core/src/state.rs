@@ -103,20 +103,21 @@ pub struct ConsensusCore {
     pub(crate) timeouts: BTreeMap<Round, TimeoutSet>,
     /// Guard: a round whose TC has already formed.
     pub(crate) tc_formed: BTreeMap<Round, ()>,
-    /// A reconfiguration staged to ride out on the next block this node authors
-    /// and retained until a QC certifies a known reconfiguration block. `None`
-    /// when no reconfiguration or removal is pending. Set by
+    /// A reconfiguration staged to ride out on the next block this node authors.
+    /// Once a QC certifies it, the exact value stays here as the immutable
+    /// transition lock and is re-emitted after view changes until an adjacent
+    /// two-chain commits one attempt. `None` when no reconfiguration or removal
+    /// is pending. Set by
     /// `RequestReconfig` for an operator-authorized change and `RequestRemoval`
-    /// for an evidence-justified removal. Exactly one pending
-    /// reconfig can be staged at a time; a new `Request*` overwrites the
-    /// previous.
+    /// for an evidence-justified removal. Exactly one pending reconfig can be
+    /// staged at a time; a new `Request*` may replace an uncertified request but
+    /// cannot replace a transition after its first QC.
     pub(crate) pending_reconfig: Option<Reconfig>,
-    /// The round at which the current epoch ends, once known: set in
+    /// The latest round carrying the locked transition that obtained a QC: set in
     /// `process_qc` when a verified QC certifies a known reconfiguration block
-    /// (to that block's round). Read by the epoch-ending vote cap, which refuses
-    /// to vote for any block more than one round past it. `None` until a
-    /// reconfiguration is certified; until then it stays `None` and the cap never
-    /// fires.
+    /// (to that block's round). Read by the epoch-ending vote gate, which permits
+    /// its adjacent child and otherwise only an exact retry of `pending_reconfig`.
+    /// `None` until a reconfiguration is certified; until then the gate never fires.
     pub(crate) epoch_ending_round: Option<Round>,
     /// First verified vote seen from each (round, voter) pair. Used by the
     /// equivocation detector in `on_vote` (equivocation detection): when a second verified
