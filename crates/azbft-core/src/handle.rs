@@ -308,6 +308,26 @@ impl ConsensusCore {
                     // prefix as an ancestor of a different consecutive pair;
                     // that linkage-level record is an inert attempt, not a second
                     // validator-set activation.
+                    //
+                    // Why skipping the ancestor never loses an effect. On the
+                    // active path a deep ancestor carrying a DIFFERENT transition
+                    // cannot arise at all: the voting gate below refuses any block
+                    // past r0+1 unless it re-emits the exact locked transition, so
+                    // no ordinary tail grows past the boundary; and `on_proposal`
+                    // runs `process_qc` per parent QC, committing ancestors one at
+                    // a time, so a multi-block batch with an uncommitted reconfig
+                    // ancestor never accumulates. The only reachable deep-ancestor
+                    // shape is a timed-out retry, whose tail carries the SAME
+                    // transition — and all three skipped effects (jail insert,
+                    // jail removal, consumed-evidence insert) are idempotent set
+                    // writes the tail applies anyway.
+                    //
+                    // `SyncApply` does NOT replay those gates: it validates block
+                    // headers and the final commit QC, nothing else. The invariant
+                    // therefore rests on the host delivering an already-validated
+                    // segment. Anyone loosening the voting gate is also loosening
+                    // this. `synced_deep_ancestor_reconfig_applies_no_effects`
+                    // pins the behaviour that follows.
                     if i + 1 == n {
                         if let Some(rc) = &block.reconfig {
                             if let Some(jr) = &rc.jail {
@@ -3626,6 +3646,492 @@ mod tests {
             out.iter()
                 .any(|c| matches!(c, Command::Send(_, ConsensusMessage::Vote(_)))),
             "operator-signed reconfig MUST produce a Vote; got {out:?}"
+        );
+    }
+    // ===== epoch-boundary coverage =========================================
+    // Added after a mutation run found four behaviour changes with no test
+    // watching them. Each test below fails when the code it covers is reverted.
+
+    /// An operator-signed transition to `next_set`, valid for epoch 0 under the
+    /// operator key `core_as` installs.
+    fn boundary_reconfig(next_set: ValidatorSet) -> Reconfig {
+        let operator = Keypair::from_seed(999_999);
+        let sig = operator.sign(
+            Domain::Reconfig,
+            &azbft_types::reconfig_signing_bytes(&next_set, 0),
+        );
+        Reconfig {
+            next_set,
+            evidence: vec![],
+            operator_sig: Some(sig),
+            jail: None,
+        }
+    }
+
+    fn sent_a_vote(out: &[Command]) -> bool {
+        out.iter()
+            .any(|c| matches!(c, Command::Send(_, ConsensusMessage::Vote(_))))
+    }
+
+    fn emitted_a_commit(out: &[Command]) -> bool {
+        out.iter().any(|c| matches!(c, Command::Commit(_)))
+    }
+
+    /// The `process_qc` conflict gate, reached by ordinary proposals.
+    ///
+    /// A first review of this PR concluded the gate was unreachable — that
+    /// `on_proposal` always rejects a conflicting block before it can enter the
+    /// tree. Arrival order says otherwise: the reconfig check runs BEFORE
+    /// `tree.insert`, which runs BEFORE `process_qc`. So a proposal carrying
+    /// transition B whose parent QC certifies transition A passes the check
+    /// while nothing is locked yet, lands in the tree, and only then does the
+    /// same event lock this node on A. The tree now holds a certified block
+    /// whose reconfig differs from the lock, which is exactly what the gate is
+    /// for.
+    #[test]
+    fn boundary_conflict_gate_is_reached_by_proposal_arrival_order() {
+        let (kps, vset) = validators();
+        let leader1 = vset.leader(Round(1));
+        let me_idx = kps.iter().position(|k| k.node_id() != leader1).unwrap();
+        let mut core = core_as(&vset, me_idx);
+
+        let a = boundary_reconfig(vset.without(&kps[0].node_id()));
+        let b = boundary_reconfig(vset.without(&kps[1].node_id()));
+        assert_ne!(a, b);
+
+        let p1 = make_reconfig_proposal(&kps, &vset, a.clone(), b"conflict-r1");
+        let b1 = p1.inner.block.clone();
+        let out1 = core.handle(Event::Proposal(p1), 1);
+        assert!(sent_a_vote(&out1), "R1 must be voted");
+        assert_eq!(core.epoch_ending_round, None, "nothing is locked after R1");
+
+        let blk2 = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: 2,
+            timestamp_ms: 2,
+            epoch: 0,
+            round: Round(2),
+            parent_qc: qc_over(b1.id(), Round(1), &kps),
+            payload_hash: blake3_id(&b"conflict-r2".to_vec()),
+            author: vset.leader(Round(2)),
+            reconfig: Some(b.clone()),
+        };
+        let p2 = Proposal {
+            block: blk2.clone(),
+            last_round_tc: None,
+        };
+        let _ = core.handle(
+            Event::Proposal(sign_proposal(kp_of(&kps, blk2.author), &p2)),
+            2,
+        );
+        assert!(
+            core.contains_block(&blk2.id()),
+            "the conflicting block reaches the tree — this is the premise"
+        );
+        assert_eq!(core.epoch_ending_round, Some(Round(1)), "locked on A@R1");
+        assert_eq!(core.pending_reconfig.as_ref(), Some(&a));
+
+        // An ordinary block extending QC(conflicting block) now hits the gate.
+        let blk3 = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: 3,
+            timestamp_ms: 3,
+            epoch: 0,
+            round: Round(3),
+            parent_qc: qc_over(blk2.id(), Round(2), &kps),
+            payload_hash: blake3_id(&b"conflict-r3".to_vec()),
+            author: vset.leader(Round(3)),
+            reconfig: None,
+        };
+        let p3 = Proposal {
+            block: blk3.clone(),
+            last_round_tc: None,
+        };
+        let out3 = core.handle(
+            Event::Proposal(sign_proposal(kp_of(&kps, blk3.author), &p3)),
+            3,
+        );
+        assert!(
+            !sent_a_vote(&out3),
+            "the conflicting parent QC must not be voted on"
+        );
+        assert!(
+            !emitted_a_commit(&out3),
+            "no commit may ride the conflicting QC"
+        );
+        assert_eq!(
+            core.pending_reconfig.as_ref(),
+            Some(&a),
+            "the locked transition must survive"
+        );
+        assert_eq!(
+            core.epoch_ending_round,
+            Some(Round(1)),
+            "the boundary must not move to the conflicting attempt"
+        );
+        assert_eq!(
+            core.high_qc().round,
+            Round(1),
+            "the conflicting QC must not be adopted"
+        );
+    }
+
+    /// The same gate, reached by bulk sync — the path that makes deleting it
+    /// unsafe. `SyncApply` inserts blocks after header validation only; it has
+    /// no reconfig gate of its own, so `process_qc`'s is the only thing standing
+    /// between a synced conflicting transition and this node's lock.
+    #[test]
+    fn boundary_conflict_gate_is_reached_by_sync_apply() {
+        let (kps, vset) = validators();
+        let leader1 = vset.leader(Round(1));
+        let me_idx = kps.iter().position(|k| k.node_id() != leader1).unwrap();
+        let mut core = core_as(&vset, me_idx);
+
+        let a = boundary_reconfig(vset.without(&kps[0].node_id()));
+        let b = boundary_reconfig(vset.without(&kps[1].node_id()));
+
+        let p1 = make_reconfig_proposal(&kps, &vset, a.clone(), b"sync-r1");
+        let b1 = p1.inner.block.clone();
+        let _ = core.handle(Event::Proposal(p1), 1);
+        let blk2 = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: 2,
+            timestamp_ms: 2,
+            epoch: 0,
+            round: Round(2),
+            parent_qc: qc_over(b1.id(), Round(1), &kps),
+            payload_hash: blake3_id(&b"sync-r2".to_vec()),
+            author: vset.leader(Round(2)),
+            reconfig: Some(a.clone()),
+        };
+        let p2 = Proposal {
+            block: blk2.clone(),
+            last_round_tc: None,
+        };
+        let _ = core.handle(
+            Event::Proposal(sign_proposal(kp_of(&kps, blk2.author), &p2)),
+            2,
+        );
+        assert_eq!(core.epoch_ending_round, Some(Round(1)), "locked on A@R1");
+        assert_eq!(core.pending_reconfig.as_ref(), Some(&a));
+
+        let blk3 = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: 3,
+            timestamp_ms: 3,
+            epoch: 0,
+            round: Round(3),
+            parent_qc: qc_over(blk2.id(), Round(2), &kps),
+            payload_hash: blake3_id(&b"sync-r3".to_vec()),
+            author: vset.leader(Round(3)),
+            reconfig: Some(b.clone()),
+        };
+        let commit_qc = qc_over(blk3.id(), Round(3), &kps);
+        let out = core.handle(
+            Event::SyncApply {
+                blocks: vec![blk3.clone()],
+                commit_qc,
+            },
+            3,
+        );
+        assert!(
+            core.contains_block(&blk3.id()),
+            "SyncApply inserts unconditionally — this is the premise"
+        );
+        assert!(
+            !emitted_a_commit(&out),
+            "a bulk-synced conflicting transition must not drive a commit"
+        );
+        assert_eq!(
+            core.pending_reconfig.as_ref(),
+            Some(&a),
+            "the lock must not be replaced by a bulk-synced conflicting transition"
+        );
+        assert_eq!(
+            core.epoch_ending_round,
+            Some(Round(1)),
+            "the boundary must not move to the synced attempt"
+        );
+    }
+
+    /// The retired-epoch output filter, with a batch that carries real output.
+    ///
+    /// The assertion this PR shipped for the filter checked a batch that had no
+    /// `Send`/`Broadcast`/`CreatePayload` in it at all, so it passed with or
+    /// without the filter. Here the boundary two-chain commit lands in the same
+    /// batch as this node's vote for the committing block, so the filter has
+    /// something to drop and removing it fails the test.
+    #[test]
+    fn boundary_commit_batch_drops_a_live_vote() {
+        let (kps, vset) = validators();
+        // `me` leads none of R1..R3, which keeps the dropped command a Send(Vote)
+        // rather than a Broadcast of our own proposal.
+        let me = vset.members()[0].node_id;
+        assert_ne!(me, vset.leader(Round(1)));
+        assert_ne!(me, vset.leader(Round(2)));
+        assert_ne!(me, vset.leader(Round(3)));
+        let me_idx = kps.iter().position(|k| k.node_id() == me).unwrap();
+        let mut core = core_as(&vset, me_idx);
+
+        let next = ValidatorSet::new(
+            kps.iter()
+                .take(3)
+                .map(|k| (k.node_id(), k.pubkey_bytes(), 1u64))
+                .collect(),
+        );
+        let locked = boundary_reconfig(next);
+
+        let r1 = make_reconfig_proposal(&kps, &vset, locked.clone(), b"drop-r1");
+        let r1_block = r1.inner.block.clone();
+        let _ = core.handle(Event::Proposal(r1), 1);
+        let qc1 = qc_over(r1_block.id(), Round(1), &kps);
+
+        let r2 = Proposal {
+            block: Block {
+                header_version: BLOCK_HEADER_VERSION_V2,
+                height: 2,
+                timestamp_ms: 2,
+                epoch: 0,
+                round: Round(2),
+                parent_qc: qc1,
+                payload_hash: blake3_id(&b"drop-r2".to_vec()),
+                author: vset.leader(Round(2)),
+                reconfig: Some(locked.clone()),
+            },
+            last_round_tc: None,
+        };
+        let r2_block = r2.block.clone();
+        let _ = core.handle(
+            Event::Proposal(sign_proposal(kp_of(&kps, r2.block.author), &r2)),
+            2,
+        );
+        let qc2 = qc_over(r2_block.id(), Round(2), &kps);
+
+        let r3 = Proposal {
+            block: Block {
+                header_version: BLOCK_HEADER_VERSION_V2,
+                height: 3,
+                timestamp_ms: 3,
+                epoch: 0,
+                round: Round(3),
+                parent_qc: qc2,
+                payload_hash: blake3_id(&b"drop-r3".to_vec()),
+                author: vset.leader(Round(3)),
+                reconfig: Some(locked),
+            },
+            last_round_tc: None,
+        };
+        let commands = core.handle(
+            Event::Proposal(sign_proposal(kp_of(&kps, r3.block.author), &r3)),
+            3,
+        );
+
+        assert!(
+            commands.iter().any(|c| matches!(
+                c,
+                Command::Commit(cb) if cb.two_chain && cb.block.reconfig.is_some()
+            )),
+            "precondition: this batch must carry the boundary two-chain commit; got {commands:?}"
+        );
+        assert!(
+            commands.iter().all(|c| !matches!(c, Command::Send(_, _))),
+            "a live vote survived the boundary-commit batch: {commands:?}"
+        );
+    }
+
+    /// Once a transition is certified, a later operator request must not replace
+    /// it. Nodes receive operator requests at different moments; letting a late
+    /// one overwrite the lock would leave honest nodes retrying different values,
+    /// and a node would then reject the QC for the transition it certified itself.
+    ///
+    /// Dropping the request is deliberate, not an oversight: the operator sees
+    /// exactly what it saw before this PR, and queuing it would mean a stale
+    /// request activating in an epoch nobody asked it for.
+    #[test]
+    fn late_operator_request_cannot_replace_the_certified_lock() {
+        let (kps, vset) = validators();
+        let leader1 = vset.leader(Round(1));
+        let me_idx = kps.iter().position(|k| k.node_id() != leader1).unwrap();
+        let mut core = core_as(&vset, me_idx);
+
+        let a = boundary_reconfig(vset.without(&kps[0].node_id()));
+
+        // Certify A: R1 carries it, R2 re-emits it and its QC(R1) locks us.
+        let p1 = make_reconfig_proposal(&kps, &vset, a.clone(), b"late-r1");
+        let b1 = p1.inner.block.clone();
+        let _ = core.handle(Event::Proposal(p1), 1);
+        let blk2 = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: 2,
+            timestamp_ms: 2,
+            epoch: 0,
+            round: Round(2),
+            parent_qc: qc_over(b1.id(), Round(1), &kps),
+            payload_hash: blake3_id(&b"late-r2".to_vec()),
+            author: vset.leader(Round(2)),
+            reconfig: Some(a.clone()),
+        };
+        let p2 = Proposal {
+            block: blk2.clone(),
+            last_round_tc: None,
+        };
+        let _ = core.handle(
+            Event::Proposal(sign_proposal(kp_of(&kps, blk2.author), &p2)),
+            2,
+        );
+        assert_eq!(core.epoch_ending_round, Some(Round(1)), "locked on A@R1");
+        assert_eq!(core.pending_reconfig.as_ref(), Some(&a));
+
+        // A well-formed, correctly signed request for a DIFFERENT set arrives late.
+        let other = vset.without(&kps[1].node_id());
+        let operator = Keypair::from_seed(999_999);
+        let other_sig = operator.sign(
+            Domain::Reconfig,
+            &azbft_types::reconfig_signing_bytes(&other, 0),
+        );
+        let _ = core.handle(Event::RequestReconfig(other.clone(), other_sig), 2);
+
+        assert_eq!(
+            core.pending_reconfig.as_ref(),
+            Some(&a),
+            "a late operator request must not replace the certified transition"
+        );
+
+        // And the consequence that makes this load-bearing: we still accept the
+        // retry of the transition we ourselves certified.
+        let retry = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: 3,
+            timestamp_ms: 3,
+            epoch: 0,
+            round: Round(3),
+            parent_qc: qc_over(blk2.id(), Round(2), &kps),
+            payload_hash: blake3_id(&b"late-retry".to_vec()),
+            author: vset.leader(Round(3)),
+            reconfig: Some(a.clone()),
+        };
+        let p3 = Proposal {
+            block: retry.clone(),
+            last_round_tc: None,
+        };
+        let retry_id = retry.id();
+        let out = core.handle(
+            Event::Proposal(sign_proposal(kp_of(&kps, retry.author), &p3)),
+            3,
+        );
+        // The observable is admission, not the vote: this proposal's parent QC
+        // completes the boundary two-chain, so the retired-epoch filter removes
+        // our vote from this very batch (see
+        // `boundary_commit_batch_drops_a_live_vote`). Admission into the tree is
+        // what `on_proposal`'s reconfig gate decides, and that gate compares
+        // against the lock — if a late request had replaced it, the retry of our
+        // own certified transition would be turned away here.
+        assert!(
+            core.contains_block(&retry_id),
+            "the retry of our own certified transition must still be admitted; got {out:?}"
+        );
+    }
+
+    /// A synced batch whose reconfig sits on a deep ancestor applies no reconfig
+    /// effects — only the two-chain commit target does.
+    ///
+    /// This shape used to be what `committed_reconfig_records_consumed_evidence`
+    /// exercised (b1..b4). That test was shortened to a two-block chain when the
+    /// `i + 1 == n` narrowing landed, which removed the only coverage that could
+    /// tell the old behaviour from the new one. Rather than restore an assertion
+    /// that is now false, this pins the new one. See the argument at the
+    /// narrowing for why the skipped effects are never lost on the active path.
+    #[test]
+    fn synced_deep_ancestor_reconfig_applies_no_effects() {
+        let (kps, vset) = validators();
+        let mut core = core_as(&vset, 0);
+        let equivocator_kp = &kps[1];
+        let proof = make_equivocation_proof(equivocator_kp);
+        let key = {
+            let v = &proof.vote_a.inner;
+            (v.voter, v.epoch, v.round.0)
+        };
+        let operator = Keypair::from_seed(999_999);
+        let next = vset.without(&equivocator_kp.node_id());
+        let removal = Reconfig {
+            next_set: next.clone(),
+            evidence: vec![proof],
+            operator_sig: Some(operator.sign(
+                Domain::Reconfig,
+                &azbft_types::reconfig_signing_bytes(&next, 0),
+            )),
+            jail: None,
+        };
+
+        let b1 = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: 1,
+            timestamp_ms: 1,
+            epoch: 0,
+            round: Round(1),
+            parent_qc: QuorumCert::genesis(),
+            payload_hash: blake3_id(&b"deep-one".to_vec()),
+            author: vset.leader(Round(1)),
+            reconfig: Some(removal),
+        };
+        let b2 = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: 2,
+            timestamp_ms: 2,
+            epoch: 0,
+            round: Round(2),
+            parent_qc: qc_over(b1.id(), Round(1), &kps),
+            payload_hash: blake3_id(&b"deep-two".to_vec()),
+            author: vset.leader(Round(2)),
+            reconfig: None,
+        };
+        let b3 = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: 3,
+            timestamp_ms: 3,
+            epoch: 0,
+            round: Round(3),
+            parent_qc: qc_over(b2.id(), Round(2), &kps),
+            payload_hash: blake3_id(&b"deep-three".to_vec()),
+            author: vset.leader(Round(3)),
+            reconfig: None,
+        };
+        let b4 = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: 4,
+            timestamp_ms: 4,
+            epoch: 0,
+            round: Round(4),
+            parent_qc: qc_over(b3.id(), Round(3), &kps),
+            payload_hash: blake3_id(&b"deep-four".to_vec()),
+            author: vset.leader(Round(4)),
+            reconfig: None,
+        };
+        let b1_id = b1.id();
+        let commit_qc = qc_over(b4.id(), Round(4), &kps);
+        let out = core.handle(
+            Event::SyncApply {
+                blocks: vec![b1, b2, b3, b4],
+                commit_qc,
+            },
+            0,
+        );
+
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, Command::Commit(cb) if cb.block.id() == b1_id)),
+            "precondition: the reconfig ancestor must actually be committed; got {out:?}"
+        );
+        assert!(
+            out.iter().any(|c| matches!(
+                c,
+                Command::Commit(cb) if cb.block.id() == b1_id && !cb.two_chain
+            )),
+            "an ancestor is an inert attempt, not an epoch roll: {out:?}"
+        );
+        assert!(
+            !core.consumed_evidence().contains(&key),
+            "only the two-chain commit target may consume evidence"
         );
     }
 }
