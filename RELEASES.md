@@ -1,8 +1,6 @@
 # Release Policy
 
-AZBFT publishes source releases of the transport-neutral consensus core. A
-release is not a production node distribution and does not grant access to the
-permissioned AZ validator network.
+AZBFT publishes source releases of the transport-neutral consensus core.
 
 ## Versioning
 

@@ -7,9 +7,8 @@ AZBFT implements a weighted, two-chain HotStuff-family protocol with determinist
 This repository contains the consensus state machine, safety rules, cryptography, deterministic devnet, offline finality verifier, and local command-line tools used to demonstrate AZBFT behavior.
 
 > **Release status:** `v0.1.0-alpha`. This is a source release of the sans-I/O
-> consensus core and deterministic tooling, not a production node
-> distribution. See [STATUS.md](STATUS.md) for the supported boundary and known
-> limitations.
+> consensus core and deterministic tooling. See [STATUS.md](STATUS.md) for the
+> supported boundary and known limitations.
 
 ## Repository boundary
 

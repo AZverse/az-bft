@@ -8,9 +8,9 @@
 | Older or untagged snapshots | Not supported |
 
 AZBFT is alpha software for protocol evaluation and integration development.
-It is not a production node distribution. The public repository excludes
-production networking, execution clients, validator admission, operator
-configuration, deployment topology and real validator credentials.
+The public repository excludes production networking, execution clients,
+validator admission, operator configuration, deployment topology and real
+validator credentials.
 
 ## Reporting a vulnerability
 
