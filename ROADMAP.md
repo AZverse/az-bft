@@ -14,8 +14,7 @@ scope and sequencing, not a delivery-date commitment.
 - Review the repository description and create the signed annotated
   `v0.1.0-alpha` tag.
 
-These are release-owner operations. They do not expand the public package into
-a production node or open access to the permissioned validator network.
+These are release-owner operations.
 
 ## Beta protocol assurance
 

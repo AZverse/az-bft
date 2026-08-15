@@ -7,9 +7,7 @@ cryptographic certificate implementation, bounded in-memory devnet, portable
 finality transcript, offline verifier, and local CLI.
 
 It is intended for protocol evaluation, integration development, and
-reproducible consensus demonstrations. It is not a production node
-distribution and does not expose an endpoint that can join a validator
-network.
+reproducible consensus demonstrations.
 
 ## Included boundary
 
