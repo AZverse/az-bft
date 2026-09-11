@@ -165,6 +165,19 @@ pub fn verify_short_anchor(anchor: &ShortAnchor, vsets: &[ValidatorSet]) -> bool
     if anchor.tip_commit.block.epoch != anchor.epoch {
         return false;
     }
+    // Tie the locked start heights to the certified tip. Without this, the
+    // start heights are unconstrained numbers: an adopter that seeds its epoch
+    // start from `locked[0]` would begin an epoch above its own tip, and a
+    // `locked[1]` at or below the tip would contradict the tip block's own
+    // epoch, which is `locked[0].epoch`.
+    if locked[0].start_height > anchor.height {
+        return false;
+    }
+    if let Some(next) = locked.get(1) {
+        if next.start_height <= anchor.height {
+            return false;
+        }
+    }
     true
 }
 
@@ -819,6 +832,46 @@ mod tests {
     }
 
     #[test]
+    fn short_anchor_rejects_current_epoch_starting_above_the_tip() {
+        let (mut anchor, vsets, _) = valid_short_anchor();
+        anchor.locked[0].start_height = anchor.height + 1;
+        assert!(!verify_short_anchor(&anchor, &vsets));
+        // The boundary case — the epoch starting exactly at the tip — is legal.
+        anchor.locked[0].start_height = anchor.height;
+        assert!(verify_short_anchor(&anchor, &vsets));
+    }
+
+    #[test]
+    fn short_anchor_rejects_next_epoch_already_started_at_the_tip() {
+        let (kps0, v0) = vset_from_seeds(&[10, 11, 12, 13]);
+        let (_kps1, v1) = vset_from_seeds(&[20, 21, 22, 23]);
+        let tip = tip_commit_cert(5, 100, 50, &kps0);
+        let height = ChainAnchorV2::from_block(&tip.block).height;
+        let mut anchor = ShortAnchor {
+            height,
+            epoch: 5,
+            tip_commit: tip,
+            locked: vec![
+                LockedEpoch {
+                    epoch: 5,
+                    start_height: 80,
+                },
+                LockedEpoch {
+                    epoch: 6,
+                    start_height: height,
+                },
+            ],
+        };
+        let vsets = vec![v0, v1];
+        assert!(
+            !verify_short_anchor(&anchor, &vsets),
+            "epoch 6 starting at the tip contradicts a tip block in epoch 5"
+        );
+        anchor.locked[1].start_height = height + 1;
+        assert!(verify_short_anchor(&anchor, &vsets));
+    }
+
+    #[test]
     fn short_anchor_accepts_two_consecutive_locked_epochs() {
         let (kps0, v0) = vset_from_seeds(&[10, 11, 12, 13]);
         let (_kps1, v1) = vset_from_seeds(&[20, 21, 22, 23]);
@@ -944,7 +997,7 @@ mod tests {
     #[test]
     fn short_anchor_rejects_height_outside_tip_block() {
         let (mut anchor, vsets, _) = valid_short_anchor();
-        anchor.height = anchor.height + 1;
+        anchor.height += 1;
         assert!(!verify_short_anchor(&anchor, &vsets));
     }
 
