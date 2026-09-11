@@ -10,6 +10,7 @@ pub mod evidence;
 pub mod ids;
 pub mod leader_schedule;
 pub mod reconfig;
+pub mod short_anchor;
 pub mod validator;
 pub mod vote;
 
@@ -32,5 +33,6 @@ pub use reconfig::{
     operator_multisig_decode, operator_multisig_encode, reconfig_signing_bytes,
     reconfig_signing_bytes_jail, CommitCert, EpochChangeCert, JailRecord, OperatorSet, Reconfig,
 };
+pub use short_anchor::{LockedEpoch, ShortAnchor, SHORT_ANCHOR_MAX_LOCKED};
 pub use validator::*;
 pub use vote::{timeout_digest, vote_digest, Proposal, Timeout, Vote};

@@ -7,7 +7,8 @@
 use azbft_crypto::aggregator::verify_agg;
 use azbft_crypto::domain::Domain;
 use azbft_types::{
-    Block, ChainAnchorV2, Checkpoint, CommitCert, EpochChangeCert, QuorumCert, ValidatorSet,
+    Block, ChainAnchorV2, Checkpoint, CommitCert, EpochChangeCert, LockedEpoch, QuorumCert,
+    ShortAnchor, ValidatorSet, SHORT_ANCHOR_MAX_LOCKED,
 };
 
 /// Verifies that `block` is committed by a certified child in the next round.
@@ -110,6 +111,78 @@ pub fn verify_checkpoint(
         }
         if cp.commit_cert.block.reconfig.is_none() {
             return false;
+        }
+    }
+    true
+}
+
+/// Verifies an ops-trusted short anchor against the supplied locked-epoch sets.
+///
+/// Unlike [`verify_checkpoint`], this does **not** walk a genesis-anchored ECC
+/// spine. Membership for each locked epoch is an out-of-band trust input: the
+/// caller must additionally confirm that `vsets` match the local ops file
+/// ([`short_anchor_matches_ops`]) before adopting.
+///
+/// Rules:
+/// 1. `1 <= locked.len() <= SHORT_ANCHOR_MAX_LOCKED`, epochs consecutive,
+///    start heights strictly increasing.
+/// 2. `vsets.len() == locked.len()`, and every set passes BLS PoP checks.
+/// 3. `anchor.epoch == locked[0].epoch`.
+/// 4. `verify_commit_cert(&anchor.tip_commit, &vsets[0])`.
+/// 5. `anchor.height` equals the tip block's certified height, and the tip
+///    block's epoch equals `anchor.epoch`.
+pub fn verify_short_anchor(anchor: &ShortAnchor, vsets: &[ValidatorSet]) -> bool {
+    let locked = &anchor.locked;
+    if locked.is_empty() || locked.len() > SHORT_ANCHOR_MAX_LOCKED {
+        return false;
+    }
+    if vsets.len() != locked.len() {
+        return false;
+    }
+    for window in locked.windows(2) {
+        if window[1].epoch != window[0].epoch + 1 {
+            return false;
+        }
+        if window[1].start_height <= window[0].start_height {
+            return false;
+        }
+    }
+    if anchor.epoch != locked[0].epoch {
+        return false;
+    }
+    for vset in vsets {
+        if !azbft_crypto::aggregator::verify_vset_pops(vset) {
+            return false;
+        }
+    }
+    if !verify_commit_cert(&anchor.tip_commit, &vsets[0]) {
+        return false;
+    }
+    let certified = ChainAnchorV2::from_block(&anchor.tip_commit.block);
+    if anchor.height != certified.height {
+        return false;
+    }
+    if anchor.tip_commit.block.epoch != anchor.epoch {
+        return false;
+    }
+    true
+}
+
+/// Confirms that every locked epoch's validator set matches the ops-trusted
+/// source. `ops_lookup(epoch)` returns the expected set for that epoch, or
+/// `None` when the ops file is missing the epoch (fail-closed).
+pub fn short_anchor_matches_ops(
+    locked: &[LockedEpoch],
+    vsets: &[ValidatorSet],
+    mut ops_lookup: impl FnMut(u64) -> Option<ValidatorSet>,
+) -> bool {
+    if locked.len() != vsets.len() {
+        return false;
+    }
+    for (le, vset) in locked.iter().zip(vsets.iter()) {
+        match ops_lookup(le.epoch) {
+            Some(expected) if expected == *vset => {}
+            _ => return false,
         }
     }
     true
@@ -681,5 +754,283 @@ mod tests {
         // Length is 3 == cp.epoch, so step 0 passes, but step 1 expects epoch 0
         // at k=0 while shifted[0].epoch == 1 ⇒ rejected.
         assert!(!verify_checkpoint(&cp, &genesis_vset, &shifted));
+    }
+
+    // ===== Short-anchor validation: verify_short_anchor adversarial tests =====
+
+    /// Tip commit cert whose 2-chain is QC'd by `signer_kps` at `epoch`/`height`.
+    fn tip_commit_cert(epoch: u64, height: u64, round: u64, signer_kps: &[Keypair]) -> CommitCert {
+        let block = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height,
+            timestamp_ms: height,
+            epoch,
+            round: Round(round),
+            parent_qc: QuorumCert::genesis(),
+            payload_hash: blake3_id(&format!("tip-block-{epoch}-{height}")),
+            author: NodeId::default(),
+            reconfig: None,
+        };
+        let child = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: height + 1,
+            timestamp_ms: height + 1,
+            epoch,
+            round: Round(round + 1),
+            parent_qc: qc_over(block.id(), Round(round), signer_kps),
+            payload_hash: blake3_id(&format!("tip-child-{epoch}-{height}")),
+            author: NodeId::default(),
+            reconfig: None,
+        };
+        CommitCert {
+            block,
+            child: child.clone(),
+            commit_qc: qc_over(child.id(), Round(round + 1), signer_kps),
+        }
+    }
+
+    fn valid_short_anchor() -> (ShortAnchor, Vec<ValidatorSet>, Vec<Keypair>) {
+        let (kps, vset) = vset_from_seeds(&[10, 11, 12, 13]);
+        let tip = tip_commit_cert(5, 100, 50, &kps);
+        let height = ChainAnchorV2::from_block(&tip.block).height;
+        let anchor = ShortAnchor {
+            height,
+            epoch: 5,
+            tip_commit: tip,
+            locked: vec![LockedEpoch {
+                epoch: 5,
+                start_height: 80,
+            }],
+        };
+        (anchor, vec![vset], kps)
+    }
+
+    #[test]
+    fn short_anchor_accepts_valid_single_locked_epoch() {
+        let (anchor, vsets, _) = valid_short_anchor();
+        assert!(verify_short_anchor(&anchor, &vsets));
+        assert!(short_anchor_matches_ops(&anchor.locked, &vsets, |e| {
+            vsets
+                .iter()
+                .zip(anchor.locked.iter())
+                .find(|(_, le)| le.epoch == e)
+                .map(|(v, _)| v.clone())
+        }));
+    }
+
+    #[test]
+    fn short_anchor_accepts_two_consecutive_locked_epochs() {
+        let (kps0, v0) = vset_from_seeds(&[10, 11, 12, 13]);
+        let (_kps1, v1) = vset_from_seeds(&[20, 21, 22, 23]);
+        let tip = tip_commit_cert(5, 100, 50, &kps0);
+        let height = ChainAnchorV2::from_block(&tip.block).height;
+        let anchor = ShortAnchor {
+            height,
+            epoch: 5,
+            tip_commit: tip,
+            locked: vec![
+                LockedEpoch {
+                    epoch: 5,
+                    start_height: 80,
+                },
+                LockedEpoch {
+                    epoch: 6,
+                    start_height: 120,
+                },
+            ],
+        };
+        let vsets = vec![v0, v1];
+        assert!(verify_short_anchor(&anchor, &vsets));
+    }
+
+    #[test]
+    fn short_anchor_rejects_empty_locked() {
+        let (mut anchor, vsets, _) = valid_short_anchor();
+        anchor.locked.clear();
+        assert!(!verify_short_anchor(&anchor, &vsets));
+    }
+
+    #[test]
+    fn short_anchor_rejects_three_locked_epochs() {
+        let (kps, v0) = vset_from_seeds(&[10, 11, 12, 13]);
+        let tip = tip_commit_cert(5, 100, 50, &kps);
+        let height = ChainAnchorV2::from_block(&tip.block).height;
+        let anchor = ShortAnchor {
+            height,
+            epoch: 5,
+            tip_commit: tip,
+            locked: vec![
+                LockedEpoch {
+                    epoch: 5,
+                    start_height: 80,
+                },
+                LockedEpoch {
+                    epoch: 6,
+                    start_height: 90,
+                },
+                LockedEpoch {
+                    epoch: 7,
+                    start_height: 100,
+                },
+            ],
+        };
+        let vsets = vec![v0.clone(), v0.clone(), v0];
+        assert!(!verify_short_anchor(&anchor, &vsets));
+    }
+
+    #[test]
+    fn short_anchor_rejects_non_consecutive_epochs() {
+        let (kps, v0) = vset_from_seeds(&[10, 11, 12, 13]);
+        let tip = tip_commit_cert(5, 100, 50, &kps);
+        let height = ChainAnchorV2::from_block(&tip.block).height;
+        let anchor = ShortAnchor {
+            height,
+            epoch: 5,
+            tip_commit: tip,
+            locked: vec![
+                LockedEpoch {
+                    epoch: 5,
+                    start_height: 80,
+                },
+                LockedEpoch {
+                    epoch: 7,
+                    start_height: 90,
+                },
+            ],
+        };
+        assert!(!verify_short_anchor(&anchor, &[v0.clone(), v0]));
+    }
+
+    #[test]
+    fn short_anchor_rejects_non_increasing_start_heights() {
+        let (kps, v0) = vset_from_seeds(&[10, 11, 12, 13]);
+        let tip = tip_commit_cert(5, 100, 50, &kps);
+        let height = ChainAnchorV2::from_block(&tip.block).height;
+        let anchor = ShortAnchor {
+            height,
+            epoch: 5,
+            tip_commit: tip,
+            locked: vec![
+                LockedEpoch {
+                    epoch: 5,
+                    start_height: 90,
+                },
+                LockedEpoch {
+                    epoch: 6,
+                    start_height: 90,
+                },
+            ],
+        };
+        assert!(!verify_short_anchor(&anchor, &[v0.clone(), v0]));
+    }
+
+    #[test]
+    fn short_anchor_rejects_vset_count_mismatch() {
+        let (anchor, vsets, _) = valid_short_anchor();
+        assert!(!verify_short_anchor(&anchor, &[]));
+        assert!(!verify_short_anchor(
+            &anchor,
+            &[vsets[0].clone(), vsets[0].clone()]
+        ));
+    }
+
+    #[test]
+    fn short_anchor_rejects_epoch_not_matching_locked0() {
+        let (mut anchor, vsets, _) = valid_short_anchor();
+        anchor.epoch = 99;
+        assert!(!verify_short_anchor(&anchor, &vsets));
+    }
+
+    #[test]
+    fn short_anchor_rejects_height_outside_tip_block() {
+        let (mut anchor, vsets, _) = valid_short_anchor();
+        anchor.height = anchor.height + 1;
+        assert!(!verify_short_anchor(&anchor, &vsets));
+    }
+
+    #[test]
+    fn short_anchor_rejects_insufficient_tip_commit_stake() {
+        let (kps, _) = vset_from_seeds(&[10, 11, 12, 13]);
+        // Tip QC signed by only 2 of 4 — below 2f+1 for n=4.
+        let tip = tip_commit_cert(5, 100, 50, &kps[..2]);
+        let height = ChainAnchorV2::from_block(&tip.block).height;
+        let (_, full) = vset_from_seeds(&[10, 11, 12, 13]);
+        let anchor = ShortAnchor {
+            height,
+            epoch: 5,
+            tip_commit: tip,
+            locked: vec![LockedEpoch {
+                epoch: 5,
+                start_height: 80,
+            }],
+        };
+        assert!(!verify_short_anchor(&anchor, &[full]));
+    }
+
+    #[test]
+    fn short_anchor_rejects_invalid_pop() {
+        use azbft_crypto::bls::BlsSecretKey;
+        use azbft_types::Member;
+        let (signer_kps, _) = vset_from_seeds(&[10, 11, 12, 13]);
+        let tip = tip_commit_cert(5, 100, 50, &signer_kps);
+        let height = ChainAnchorV2::from_block(&tip.block).height;
+        // Build a BLS-keyed set with a forged PoP on member 0, but tip_commit is
+        // still signed by the secp genesis-style set — so commit_cert verify will
+        // fail against the BLS set. Use the same node ids as the tip signers so
+        // the failure is specifically PoP (after we make tip verify against a
+        // secp set that also has BLS columns).
+        let members: Vec<Member> = signer_kps
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let bsk = BlsSecretKey::from_seed(900 + i as u64);
+                let pop = if i == 0 {
+                    BlsSecretKey::from_seed(515_151)
+                        .prove_possession()
+                        .to_bytes()
+                        .to_vec()
+                } else {
+                    bsk.prove_possession().to_bytes().to_vec()
+                };
+                Member::new(
+                    k.node_id(),
+                    k.pubkey_bytes(),
+                    bsk.public().to_bytes().to_vec(),
+                    pop,
+                    1u64,
+                )
+            })
+            .collect();
+        let bad = ValidatorSet::new_members(members);
+        let anchor = ShortAnchor {
+            height,
+            epoch: 5,
+            tip_commit: tip,
+            locked: vec![LockedEpoch {
+                epoch: 5,
+                start_height: 80,
+            }],
+        };
+        // PoP gate runs before commit_cert; forged PoP must reject.
+        assert!(!verify_short_anchor(&anchor, &[bad]));
+    }
+
+    #[test]
+    fn short_anchor_ops_mismatch_rejected() {
+        let (anchor, vsets, _) = valid_short_anchor();
+        let (_, other) = vset_from_seeds(&[90, 91, 92, 93]);
+        assert!(!short_anchor_matches_ops(&anchor.locked, &vsets, |_| Some(
+            other.clone()
+        )));
+        assert!(!short_anchor_matches_ops(&anchor.locked, &vsets, |_| None));
+    }
+
+    #[test]
+    fn short_anchor_ops_match_accepts_exact_sets() {
+        let (anchor, vsets, _) = valid_short_anchor();
+        let expected = vsets[0].clone();
+        assert!(short_anchor_matches_ops(&anchor.locked, &vsets, |e| (e
+            == 5)
+            .then(|| expected.clone())));
     }
 }
