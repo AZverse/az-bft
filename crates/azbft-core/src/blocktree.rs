@@ -5,6 +5,7 @@ pub struct BlockTree {
     blocks: BTreeMap<Hash, Block>,
     committed: BTreeMap<Hash, ()>,
     last_committed_round: u64,
+    last_committed_id: Option<Hash>,
 }
 
 impl Default for BlockTree {
@@ -19,6 +20,7 @@ impl BlockTree {
             blocks: BTreeMap::new(),
             committed: BTreeMap::new(),
             last_committed_round: 0,
+            last_committed_id: None,
         }
     }
 
@@ -58,6 +60,7 @@ impl BlockTree {
         for b in &chain {
             self.committed.insert(b.id(), ());
             self.last_committed_round = b.round.0;
+            self.last_committed_id = Some(b.id());
         }
         chain
     }
@@ -70,6 +73,10 @@ impl BlockTree {
 
     pub fn last_committed_round(&self) -> u64 {
         self.last_committed_round
+    }
+
+    pub fn last_committed_id(&self) -> Option<Hash> {
+        self.last_committed_id
     }
 }
 
