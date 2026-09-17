@@ -2404,6 +2404,153 @@ mod tests {
     }
 
     #[test]
+    fn live_ancestry_is_authenticated_atomic_and_does_not_advance_consensus() {
+        let (keys, vset) = validators();
+        let mut core = core_as(&vset, 0);
+        let first = Block {
+            header_version: BLOCK_HEADER_VERSION_V2,
+            height: 1,
+            timestamp_ms: 1,
+            epoch: 0,
+            round: Round(1),
+            parent_qc: QuorumCert::genesis(),
+            payload_hash: blake3_id(&b"ancestor-one".to_vec()),
+            author: vset.leader(Round(1)),
+            reconfig: None,
+        };
+        let second = Block {
+            height: 2,
+            timestamp_ms: 2,
+            round: Round(2),
+            parent_qc: qc_over(first.id(), first.round, &keys),
+            author: vset.leader(Round(2)),
+            ..first.clone()
+        };
+        let certificate = qc_over(second.id(), second.round, &keys);
+        let before_round = core.round();
+        let before_qc = core.high_qc().clone();
+        let before_safety = core.safety_snapshot();
+        let mut invalid = certificate.clone();
+        invalid.agg = QuorumCert::genesis().agg;
+        assert!(core
+            .import_live_ancestors(&[first.clone(), second.clone()], &invalid)
+            .is_err());
+        assert!(
+            !core.contains_block(&first.id()),
+            "failed import must be atomic"
+        );
+        assert!(core
+            .import_live_ancestors(std::slice::from_ref(&second), &certificate)
+            .is_err());
+        assert!(core.import_live_ancestors(&[], &certificate).is_err());
+        assert!(core
+            .import_live_ancestors(&vec![first.clone(); 65], &certificate)
+            .is_err());
+        let mut oversized = vec![first.clone()];
+        for round in 2..=65 {
+            let parent = oversized.last().unwrap();
+            oversized.push(Block {
+                height: round,
+                timestamp_ms: round,
+                round: Round(round),
+                parent_qc: qc_over(parent.id(), parent.round, &keys),
+                author: vset.leader(Round(round)),
+                ..first.clone()
+            });
+        }
+        let oversized_qc = qc_over(oversized.last().unwrap().id(), Round(65), &keys);
+        assert!(core
+            .import_live_ancestors(&oversized, &oversized_qc)
+            .is_err());
+        let mut wrong_height = second.clone();
+        wrong_height.height += 1;
+        let signed_wrong_height = qc_over(wrong_height.id(), wrong_height.round, &keys);
+        assert!(core
+            .import_live_ancestors(&[first.clone(), wrong_height], &signed_wrong_height)
+            .is_err());
+        let mut wrong_round = second.clone();
+        wrong_round.round = first.round;
+        wrong_round.author = first.author;
+        let signed_wrong_round = qc_over(wrong_round.id(), wrong_round.round, &keys);
+        assert!(core
+            .import_live_ancestors(&[first.clone(), wrong_round], &signed_wrong_round)
+            .is_err());
+        assert!(!core.contains_block(&first.id()));
+        core.import_live_ancestors(&[first.clone(), second.clone()], &certificate)
+            .unwrap();
+        assert!(core.contains_block(&first.id()));
+        assert!(core.contains_block(&second.id()));
+        assert_eq!(core.round(), before_round);
+        assert_eq!(core.high_qc(), &before_qc);
+        assert_eq!(core.safety_snapshot(), before_safety);
+        assert_eq!(core.tree.last_committed_round(), 0);
+        assert_eq!(
+            core.live_ancestors(second.id(), 2),
+            vec![first.clone(), second.clone()]
+        );
+        assert_eq!(core.live_ancestors(second.id(), 1), vec![second.clone()]);
+        let mut bad_anchor = second.clone();
+        bad_anchor.parent_qc.agg = QuorumCert::genesis().agg;
+        let bad_anchor_id = bad_anchor.id();
+        let signed_bad_anchor = qc_over(bad_anchor_id, bad_anchor.round, &keys);
+        assert!(core
+            .import_live_ancestors(&[bad_anchor], &signed_bad_anchor)
+            .is_err());
+        assert!(!core.contains_block(&bad_anchor_id));
+        let mut wrong_anchor_round = second.clone();
+        wrong_anchor_round.round = Round(4);
+        wrong_anchor_round.author = vset.leader(Round(4));
+        wrong_anchor_round.parent_qc = qc_over(first.id(), Round(2), &keys);
+        let wrong_anchor_id = wrong_anchor_round.id();
+        let signed_wrong_anchor = qc_over(wrong_anchor_id, Round(4), &keys);
+        assert!(core
+            .import_live_ancestors(&[wrong_anchor_round], &signed_wrong_anchor)
+            .is_err());
+        assert!(!core.contains_block(&wrong_anchor_id));
+        core.import_live_ancestors(&[first.clone(), second.clone()], &certificate)
+            .unwrap();
+        assert_eq!(core.tree.last_committed_round(), 0);
+        let mut committed = Vec::new();
+        assert!(core.process_qc(&certificate, &mut committed));
+        let commit = committed
+            .iter()
+            .find_map(|command| match command {
+                Command::Commit(entry) => Some(entry),
+                _ => None,
+            })
+            .expect("normal QC processing commits the certified parent");
+        assert_eq!(commit.block.id(), first.id());
+        assert!(core
+            .import_live_ancestors(&[first.clone(), second.clone()], &certificate)
+            .is_err());
+        core.import_live_ancestors(std::slice::from_ref(&second), &certificate)
+            .unwrap();
+        let mut repeated = Vec::new();
+        assert!(core.process_qc(&certificate, &mut repeated));
+        assert!(!repeated
+            .iter()
+            .any(|command| matches!(command, Command::Commit(_))));
+        let mut restored = core_as(&vset, 0).with_chain_anchor(ChainAnchorV2::from_block(&first));
+        restored
+            .restore_committed_tip(&CommitCert {
+                block: first,
+                child: second.clone(),
+                commit_qc: certificate.clone(),
+            })
+            .unwrap();
+        let restored_safety = restored.safety_snapshot();
+        restored
+            .import_live_ancestors(std::slice::from_ref(&second), &certificate)
+            .unwrap();
+        assert_eq!(restored.safety_snapshot(), restored_safety);
+        let mut after_restart = Vec::new();
+        assert!(restored.process_qc(&certificate, &mut after_restart));
+        assert!(!after_restart
+            .iter()
+            .any(|command| matches!(command, Command::Commit(_))));
+    }
+
+    #[test]
     fn sync_apply_ingests_and_commits_tip() {
         let (kps, vset) = validators();
         let mut core = core_as(&vset, 0);

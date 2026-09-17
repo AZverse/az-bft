@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod ancestry;
 pub mod blocktree;
 pub mod command;
 pub mod event;
