@@ -104,8 +104,10 @@ an AZBFT finality decision.
 
 On local timeout the validator signs `(epoch, round)` in the timeout domain,
 includes its `high_qc`, broadcasts the timeout, and backs off the next timer
-exponentially. The backoff doubles on consecutive timeouts and resets on round
-progress; growth is capped by the implementation.
+exponentially. The backoff doubles on consecutive timeouts and resets only on a
+certified round — one carried by a QC. Leaving a round by timeout certificate is
+not progress and carries the backoff over, so the timer keeps growing while
+rounds keep expiring; growth is capped by the implementation.
 
 Verified timeouts are deduplicated by sender and weighted by stake. Weight
 exceeding the maximum Byzantine weight causes an honest validator that is
