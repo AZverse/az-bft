@@ -65,6 +65,21 @@ fn command_execution_class(command: &Command) -> u8 {
     }
 }
 
+/// Why a round was left, which decides whether the pacemaker backoff survives.
+///
+/// A round that produced a QC is consensus progress and resets the backoff. A
+/// round that only produced a timeout certificate produced no block: leaving it
+/// is the failure the backoff exists to answer, so the backoff must carry over
+/// and keep growing. Resetting on both made the spec's "doubles on consecutive
+/// timeouts" unreachable, because a stuck chain leaves every round by TC.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RoundExit {
+    /// The round was certified: a QC for it (or a later round) was processed.
+    Certified,
+    /// The round expired and a timeout certificate carried us out of it.
+    TimedOut,
+}
+
 impl ConsensusCore {
     /// Bootstrap into the current round: if leader, request a payload; always arm the
     /// round timer.
@@ -380,16 +395,19 @@ impl ConsensusCore {
         }
 
         // (4) advance.
-        self.advance_round(Round(qc.round.0 + 1), out);
+        self.advance_round(Round(qc.round.0 + 1), RoundExit::Certified, out);
         true
     }
 
-    /// Move to `target` if it is strictly ahead of the current round, resetting
-    /// the pacemaker backoff and entering the new round.
-    pub(crate) fn advance_round(&mut self, target: Round, out: &mut Vec<Command>) {
+    /// Move to `target` if it is strictly ahead of the current round, entering
+    /// the new round. Only a [`RoundExit::Certified`] advance clears the
+    /// pacemaker backoff.
+    pub(crate) fn advance_round(&mut self, target: Round, exit: RoundExit, out: &mut Vec<Command>) {
         if target > self.round {
             self.round = target;
-            self.pacemaker.on_progress(target);
+            if exit == RoundExit::Certified {
+                self.pacemaker.on_progress(target);
+            }
             self.enter_round(target, out);
         }
     }
@@ -956,7 +974,7 @@ impl ConsensusCore {
             if self.high_tc.as_ref().is_none_or(|h| tc.round > h.round) {
                 self.high_tc = Some(tc);
             }
-            self.advance_round(Round(t.round.0 + 1), &mut out);
+            self.advance_round(Round(t.round.0 + 1), RoundExit::TimedOut, &mut out);
         }
         out
     }
@@ -1050,6 +1068,105 @@ mod tests {
         assert!(
             diverges,
             "StakeWeighted must diverge from round-robin for some round"
+        );
+    }
+
+    /// The duration of the `SetTimer` armed for `round`, if the batch armed one.
+    fn armed_timer(out: &[Command], round: Round) -> Option<u64> {
+        out.iter().find_map(|command| match command {
+            Command::SetTimer(r, duration) if *r == round => Some(*duration),
+            _ => None,
+        })
+    }
+
+    /// Drive `round` to a timeout certificate: the local timer fires, then a
+    /// quorum of peer timeouts for the same round forms the TC that carries us
+    /// into `round + 1`. Returns the commands emitted when entering that round.
+    fn time_out_round(core: &mut ConsensusCore, kps: &[Keypair], round: Round) -> Vec<Command> {
+        core.handle(Event::LocalTimeout(round), 0);
+        let mut out = Vec::new();
+        for kp in kps.iter().take(3) {
+            let timeout = Timeout {
+                epoch: 0,
+                round,
+                high_qc: QuorumCert::genesis(),
+                sender: kp.node_id(),
+            };
+            out = core.handle(Event::RemoteTimeout(sign_timeout(kp, &timeout)), 0);
+        }
+        assert_eq!(
+            core.round(),
+            Round(round.0 + 1),
+            "a quorum of timeouts for {round:?} advances one round"
+        );
+        out
+    }
+
+    // ---- Pacemaker backoff across consecutive timed-out rounds ----
+
+    /// A round carried out by a TC produced no block, so leaving it is not
+    /// progress and must not clear the backoff. The timer therefore keeps
+    /// doubling for as long as rounds keep expiring, which is the only way a
+    /// chain whose rounds all expire before a proposal can be voted recovers:
+    /// the timer has to grow past however long the round actually needs.
+    ///
+    /// Resetting on every advance capped the backoff at a single doubling,
+    /// because a stuck chain leaves every round by TC.
+    #[test]
+    fn consecutive_timed_out_rounds_keep_doubling_the_timer() {
+        let (kps, vset) = validators();
+        let mut core = core_as(&vset, 0);
+        core.start();
+
+        let mut armed = Vec::new();
+        for round in 1..=8u64 {
+            let out = time_out_round(&mut core, &kps, Round(round));
+            armed.push(
+                armed_timer(&out, Round(round + 1)).expect("entering a round arms its timer"),
+            );
+        }
+        assert_eq!(
+            armed,
+            vec![200, 400, 800, 1600, 3200, 6400, 6400, 6400],
+            "base 100 doubles once per consecutive timed-out round, up to the cap"
+        );
+    }
+
+    /// The counterpart: a QC is progress, so the backoff returns to base even
+    /// after the previous round expired.
+    #[test]
+    fn a_certified_round_resets_the_backoff() {
+        let (kps, vset) = validators();
+        let leader2 = vset.leader(Round(2));
+        let me_idx = kps.iter().position(|k| k.node_id() == leader2).unwrap();
+        let mut core = core_as(&vset, me_idx);
+        core.start();
+
+        // Round 1 expires, so the backoff is one doubling deep.
+        core.handle(Event::LocalTimeout(Round(1)), 0);
+
+        // A quorum of votes for the round-1 block certifies it and advances us.
+        let b1 = block_round1(vset.leader(Round(1)), b"payload-1");
+        core.tree_insert_for_test(b1.clone());
+        let mut out = Vec::new();
+        for kp in kps.iter().take(3) {
+            let vote = Vote {
+                epoch: 0,
+                block_id: b1.id(),
+                round: Round(1),
+                voter: kp.node_id(),
+            };
+            out = core.handle(Event::Vote(sign_vote(kp, &vote)), 0);
+        }
+        assert_eq!(
+            core.round(),
+            Round(2),
+            "a QC for round 1 advances to round 2"
+        );
+        assert_eq!(
+            armed_timer(&out, Round(2)),
+            Some(100),
+            "a certified advance returns the timer to base"
         );
     }
 
@@ -1673,7 +1790,7 @@ mod tests {
             } else {
                 higher_round
             };
-            core.advance_round(round, &mut Vec::new());
+            core.advance_round(round, RoundExit::Certified, &mut Vec::new());
             let commands = core.handle(Event::LocalTimeout(round), 0);
             let timeout = commands
                 .into_iter()
