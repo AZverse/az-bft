@@ -402,12 +402,7 @@ impl ConsensusCore {
     /// Move to `target` if it is strictly ahead of the current round, entering
     /// the new round. Only a [`RoundExit::Certified`] advance clears the
     /// pacemaker backoff.
-    pub(crate) fn advance_round(
-        &mut self,
-        target: Round,
-        exit: RoundExit,
-        out: &mut Vec<Command>,
-    ) {
+    pub(crate) fn advance_round(&mut self, target: Round, exit: RoundExit, out: &mut Vec<Command>) {
         if target > self.round {
             self.round = target;
             if exit == RoundExit::Certified {
@@ -1124,7 +1119,7 @@ mod tests {
         core.start();
 
         let mut armed = Vec::new();
-        for round in 1..=4u64 {
+        for round in 1..=8u64 {
             let out = time_out_round(&mut core, &kps, Round(round));
             armed.push(
                 armed_timer(&out, Round(round + 1)).expect("entering a round arms its timer"),
@@ -1132,8 +1127,8 @@ mod tests {
         }
         assert_eq!(
             armed,
-            vec![200, 400, 800, 1600],
-            "base 100 doubles once per consecutive timed-out round"
+            vec![200, 400, 800, 1600, 3200, 6400, 6400, 6400],
+            "base 100 doubles once per consecutive timed-out round, up to the cap"
         );
     }
 
@@ -1163,7 +1158,11 @@ mod tests {
             };
             out = core.handle(Event::Vote(sign_vote(kp, &vote)), 0);
         }
-        assert_eq!(core.round(), Round(2), "a QC for round 1 advances to round 2");
+        assert_eq!(
+            core.round(),
+            Round(2),
+            "a QC for round 1 advances to round 2"
+        );
         assert_eq!(
             armed_timer(&out, Round(2)),
             Some(100),

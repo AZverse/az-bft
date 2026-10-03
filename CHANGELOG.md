@@ -5,7 +5,18 @@ Semantic Versioning for source releases, including prerelease identifiers.
 
 ## [Unreleased]
 
-No unreleased changes are recorded.
+### Fixed
+
+- The pacemaker backoff is no longer reset when a round is left by timeout
+  certificate, only when a round is certified. Resetting on every advance
+  capped the round timer at one doubling, so a chain whose proposals arrived
+  after the timer could not recover by backing off.
+
+### Changed
+
+- The round timer stops growing after six doublings (64 times the base) instead
+  of sixteen. With the backoff now carried across timed-out rounds the cap is
+  reachable, and it bounds how long validators wait once the cause is gone.
 
 ## [0.1.0-alpha] - 2026-08-04
 
