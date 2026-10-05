@@ -116,6 +116,36 @@ pub(crate) fn verify_operator_multisig(set: &OperatorSet, msg: &[u8], sig_bytes:
     (seen.len() as u32) >= set.threshold
 }
 
+/// Evidence names who may be punished; it authorizes nothing else. Every
+/// surviving member keeps its exact secp key, BLS key and proof of possession,
+/// and only an offender named by the evidence may lose stake. Without this, a
+/// genuine proof against one validator could carry a stake or key change for
+/// another one through the operator-free path (AZverse/layer1_infra#61).
+fn only_offenders_changed(current: &ValidatorSet, rc: &Reconfig) -> bool {
+    rc.next_set.members().iter().all(|next| {
+        let Some(before) = current
+            .members()
+            .iter()
+            .find(|member| member.node_id == next.node_id)
+        else {
+            return false;
+        };
+        let offender = rc
+            .evidence
+            .iter()
+            .any(|proof| proof.vote_a.inner.voter == next.node_id);
+        let stake_allowed = if offender {
+            next.stake <= before.stake
+        } else {
+            next.stake == before.stake
+        };
+        stake_allowed
+            && next.pubkey == before.pubkey
+            && next.bls_pubkey == before.bls_pubkey
+            && next.bls_pop == before.bls_pop
+    })
+}
+
 /// Authorize a reconfig block: EITHER a valid operator signature over
 /// (next_set, epoch[, jail]), OR a pure evidence-driven punishment (Evidence-based removal / Stake slashing).
 /// Empty-evidence + no-signature ⇒ rejected (closes the unauthorized-reconfig gap).
@@ -131,7 +161,9 @@ pub(crate) fn verify_operator_multisig(set: &OperatorSet, msg: &[u8], sig_bytes:
 ///     `reconfig_signing_bytes_jail(next_set, epoch, &rc.jail)`, which includes
 ///     the JailRecord (offender + until_epoch) to prevent tampering post-signing.
 /// - Path 2: pure evidence-driven punishment — no additions (every next_set
-///   member was in current), non-empty evidence, every proof valid+relevant
+///   member was in current), a non-empty next_set, no change to any surviving
+///   member's keys or proof of possession, no stake change except a reduction
+///   for an offender named by the evidence, non-empty evidence, every proof valid+relevant
 ///   (verify_removal_justified rejects irrelevant/invalid/fake-slash), and
 ///   every punished validator (removed OR stake-slashed) is covered by at
 ///   least one proof in the evidence list.
@@ -175,7 +207,12 @@ pub fn verify_reconfig_authorized(
         .members()
         .iter()
         .all(|m| current.contains(&m.node_id));
-    if no_additions && !rc.evidence.is_empty() && verify_removal_justified(current, rc) {
+    if no_additions
+        && !rc.next_set.is_empty()
+        && !rc.evidence.is_empty()
+        && only_offenders_changed(current, rc)
+        && verify_removal_justified(current, rc)
+    {
         // A member is "punished" if:
         //   (a) removed: in current but not in next_set.
         //   (b) stake-slashed: in both but with strictly reduced stake in next_set.
@@ -208,8 +245,8 @@ mod tests {
     use azbft_crypto::keypair::Keypair;
     use azbft_types::evidence::EquivocationProof;
     use azbft_types::{
-        blake3_id, operator_multisig_encode, reconfig_signing_bytes, Hash, OperatorSet, Reconfig,
-        Round, Signed, ValidatorSet, Vote,
+        blake3_id, operator_multisig_encode, reconfig_signing_bytes, Hash, Member, NodeId,
+        OperatorSet, Reconfig, Round, Signed, ValidatorSet, Vote,
     };
 
     /// Build a single-validator set from a keypair.
@@ -651,7 +688,8 @@ mod tests {
     fn reconfig_authorized_pure_evidence_removal() {
         // next_set = current.without(X), evidence=[valid proof_X], operator_sig=None → true
         let kp = Keypair::from_seed(1);
-        let current = single_vset(&kp);
+        let other = Keypair::from_seed(2);
+        let current = vset_with_stakes(&[(&kp, 1), (&other, 1)]);
         let next_set = current.without(&kp.node_id());
         let proof = valid_proof(&kp);
         let rc = Reconfig {
@@ -1151,5 +1189,142 @@ mod tests {
         assert!(!verify_reconfig_authorized(
             &current, &rc_list, epoch, &op_set
         ));
+    }
+
+    // --- AZverse/layer1_infra#61: evidence may only change its offender ---
+
+    fn four_with_bls() -> (Vec<Keypair>, ValidatorSet) {
+        let keys: Vec<_> = (41..45).map(Keypair::from_seed).collect();
+        let members = keys
+            .iter()
+            .enumerate()
+            .map(|(i, kp)| {
+                Member::new(
+                    kp.node_id(),
+                    kp.pubkey_bytes(),
+                    vec![i as u8 + 1; 48],
+                    vec![i as u8 + 1; 96],
+                    1,
+                )
+            })
+            .collect();
+        (keys, ValidatorSet::new_members(members))
+    }
+
+    fn evidence_reconfig(next: Vec<Member>, offender: &Keypair) -> Reconfig {
+        Reconfig {
+            next_set: ValidatorSet::new_members(next),
+            evidence: vec![valid_proof(offender)],
+            operator_sig: None,
+            jail: None,
+        }
+    }
+
+    fn authorized(current: &ValidatorSet, rc: &Reconfig) -> bool {
+        let op_pk = Keypair::from_seed(OP_SEED).pubkey_bytes();
+        verify_reconfig_authorized(current, rc, 0, &azbft_types::OperatorSet::single(op_pk))
+    }
+
+    fn survivors(current: &ValidatorSet, offender: &Keypair) -> Vec<Member> {
+        current
+            .members()
+            .iter()
+            .filter(|m| m.node_id != offender.node_id())
+            .cloned()
+            .collect()
+    }
+
+    fn change(members: &mut [Member], id: NodeId, edit: impl FnOnce(&mut Member)) {
+        edit(members.iter_mut().find(|m| m.node_id == id).unwrap());
+    }
+
+    #[test]
+    fn evidence_removal_of_the_offender_alone_is_authorized() {
+        let (keys, current) = four_with_bls();
+        let rc = evidence_reconfig(survivors(&current, &keys[0]), &keys[0]);
+        assert!(authorized(&current, &rc));
+    }
+
+    #[test]
+    fn evidence_slash_of_the_offender_alone_is_authorized() {
+        let (keys, current) = four_with_bls();
+        let mut next = current.members().to_vec();
+        change(&mut next, keys[0].node_id(), |m| m.stake = 0);
+        let rc = evidence_reconfig(next, &keys[0]);
+        assert!(authorized(&current, &rc));
+    }
+
+    #[test]
+    fn evidence_cannot_raise_another_members_stake() {
+        let (keys, current) = four_with_bls();
+        let mut next = survivors(&current, &keys[0]);
+        change(&mut next, keys[1].node_id(), |m| m.stake = 100);
+        assert!(!authorized(&current, &evidence_reconfig(next, &keys[0])));
+    }
+
+    #[test]
+    fn evidence_cannot_lower_another_members_stake() {
+        let (keys, current) = four_with_bls();
+        let mut next = survivors(&current, &keys[0]);
+        change(&mut next, keys[1].node_id(), |m| m.stake = 0);
+        assert!(!authorized(&current, &evidence_reconfig(next, &keys[0])));
+    }
+
+    #[test]
+    fn evidence_cannot_replace_another_members_secp_key() {
+        let (keys, current) = four_with_bls();
+        let mut next = survivors(&current, &keys[0]);
+        let attacker = Keypair::from_seed(99).pubkey_bytes();
+        change(&mut next, keys[1].node_id(), |m| m.pubkey = attacker);
+        assert!(!authorized(&current, &evidence_reconfig(next, &keys[0])));
+    }
+
+    #[test]
+    fn evidence_cannot_replace_another_members_bls_key_or_pop() {
+        let (keys, current) = four_with_bls();
+        for edit in [
+            (|m: &mut Member| m.bls_pubkey = vec![0xee; 48]) as fn(&mut Member),
+            |m: &mut Member| m.bls_pop = vec![0xee; 96],
+        ] {
+            let mut next = survivors(&current, &keys[0]);
+            change(&mut next, keys[1].node_id(), edit);
+            assert!(!authorized(&current, &evidence_reconfig(next, &keys[0])));
+        }
+    }
+
+    #[test]
+    fn a_slashed_offender_keeps_its_keys() {
+        let (keys, current) = four_with_bls();
+        let mut next = current.members().to_vec();
+        let replacement = Keypair::from_seed(98).pubkey_bytes();
+        change(&mut next, keys[0].node_id(), |m| {
+            m.stake = 0;
+            m.pubkey = replacement;
+        });
+        assert!(!authorized(&current, &evidence_reconfig(next, &keys[0])));
+    }
+
+    #[test]
+    fn evidence_cannot_empty_the_validator_set() {
+        let kp = Keypair::from_seed(1);
+        let current = single_vset(&kp);
+        let rc = evidence_reconfig(Vec::new(), &kp);
+        assert!(!authorized(&current, &rc));
+    }
+
+    #[test]
+    fn operator_signed_reconfig_may_still_change_any_member() {
+        let (keys, current) = four_with_bls();
+        let mut next = current.members().to_vec();
+        change(&mut next, keys[1].node_id(), |m| m.stake = 100);
+        let next_set = ValidatorSet::new_members(next);
+        let sig = op_sign(&next_set, 0);
+        let rc = Reconfig {
+            next_set,
+            evidence: Vec::new(),
+            operator_sig: Some(sig),
+            jail: None,
+        };
+        assert!(authorized(&current, &rc));
     }
 }
