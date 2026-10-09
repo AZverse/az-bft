@@ -10,6 +10,20 @@ use azbft_types::Round;
 /// cap of 16 doublings would leave a 70 ms base timer at about 76 minutes.
 pub const MAX_BACKOFF_DOUBLINGS: u32 = 6;
 
+/// How many consecutive timeouts after a certified round leave the timer at
+/// base before it starts doubling.
+///
+/// One crashed validator expires two rounds in a row on every pass of the
+/// round-robin schedule: its own, and its predecessor's, whose votes are
+/// addressed to it as the next leader and are lost. If the second of those
+/// rounds is armed with a doubled timer, a 4-validator devnet with one validator
+/// down spends 50 + 50 + 200 + 400 ms per pass at a 200 ms base and commits
+/// 2.76 blocks/s against 23 with everyone up. Leaving the first timeout
+/// unbacked arms that round at base. Doubling still starts at the second
+/// consecutive timeout, so a round length too short for the load is still
+/// outgrown, one round later than before.
+pub const UNBACKED_TIMEOUTS: u32 = 1;
+
 pub struct Pacemaker {
     base: u64,
     consecutive_timeouts: u32,
@@ -24,8 +38,11 @@ impl Pacemaker {
     }
 
     pub fn timer_duration(&self, _round: Round) -> u64 {
-        self.base
-            .saturating_mul(1u64 << self.consecutive_timeouts.min(MAX_BACKOFF_DOUBLINGS))
+        let doublings = self
+            .consecutive_timeouts
+            .saturating_sub(UNBACKED_TIMEOUTS)
+            .min(MAX_BACKOFF_DOUBLINGS);
+        self.base.saturating_mul(1u64 << doublings)
     }
 
     pub fn on_local_timeout(&mut self, _round: Round) {
@@ -47,16 +64,23 @@ mod tests {
         let mut p = Pacemaker::new(100);
         assert_eq!(p.timer_duration(Round(1)), 100);
         p.on_local_timeout(Round(1));
-        assert_eq!(p.timer_duration(Round(2)), 200);
+        assert_eq!(
+            p.timer_duration(Round(2)),
+            100,
+            "the first timeout after progress keeps the base timer"
+        );
         p.on_local_timeout(Round(2));
-        assert_eq!(p.timer_duration(Round(3)), 400);
+        assert_eq!(p.timer_duration(Round(3)), 200);
+        p.on_local_timeout(Round(3));
+        assert_eq!(p.timer_duration(Round(4)), 400);
     }
 
     #[test]
     fn progress_resets_backoff() {
         let mut p = Pacemaker::new(100);
         p.on_local_timeout(Round(1));
-        p.on_progress(Round(2));
+        p.on_local_timeout(Round(2));
+        p.on_progress(Round(3));
         assert_eq!(p.timer_duration(Round(3)), 100);
     }
 
@@ -64,7 +88,7 @@ mod tests {
     #[test]
     fn backoff_stops_growing_at_the_cap() {
         let mut p = Pacemaker::new(70);
-        for round in 1..=u64::from(MAX_BACKOFF_DOUBLINGS) {
+        for round in 1..=u64::from(UNBACKED_TIMEOUTS + MAX_BACKOFF_DOUBLINGS) {
             p.on_local_timeout(Round(round));
         }
         let cap = 70 << MAX_BACKOFF_DOUBLINGS;

@@ -14,6 +14,11 @@ Semantic Versioning for source releases, including prerelease identifiers.
 
 ### Changed
 
+- The first timeout after a certified round no longer doubles the round timer;
+  doubling starts at the second consecutive timeout. One crashed validator
+  expires two rounds in a row on each pass of the round-robin schedule (its own
+  and its predecessor, whose votes go to it), and the doubled second round cut a
+  four-validator devnet from 23 to 2.76 blocks/s.
 - The round timer stops growing after six doublings (64 times the base) instead
   of sixteen. With the backoff now carried across timed-out rounds the cap is
   reachable, and it bounds how long validators wait once the cause is gone.

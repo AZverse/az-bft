@@ -1127,8 +1127,9 @@ mod tests {
         }
         assert_eq!(
             armed,
-            vec![200, 400, 800, 1600, 3200, 6400, 6400, 6400],
-            "base 100 doubles once per consecutive timed-out round, up to the cap"
+            vec![100, 200, 400, 800, 1600, 3200, 6400, 6400],
+            "base 100 holds for the first timed-out round, then doubles once per further \
+             consecutive one, up to the cap"
         );
     }
 
