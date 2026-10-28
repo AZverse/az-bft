@@ -407,12 +407,54 @@ impl ConsensusCore {
         &self.vset
     }
 
-    /// the leader for `round` under this core's configured mode. The consensus
-    /// leader checks (`on_proposal` author validation, "am I the leader") MUST route
-    /// through here rather than the raw round-robin `vset.leader`, or a StakeWeighted
-    /// chain would compute different leaders on different nodes and fork.
+    /// The **base-schedule** leader for `round` under this core's configured mode,
+    /// without the skip-absent adjustment. Under a skip-absent schedule the real
+    /// leader also depends on the proposal's ancestry: consensus checks use
+    /// [`leader_after_parent`](Self::leader_after_parent),
+    /// [`proposal_leader`](Self::proposal_leader) or
+    /// [`current_leader`](Self::current_leader). For the base schedules all of them
+    /// equal this.
     pub fn leader(&self, round: Round) -> NodeId {
         self.vset.leader_with_mode(round, self.leader_mode)
+    }
+
+    /// The leader of `round` for a proposal extending the block certified by
+    /// `parent_qc` (blockchain#95). Its liveness QC is the QC that parent block
+    /// carries. `None` only under a skip-absent schedule when that parent block is
+    /// not in the tree: the leader cannot be known, so nothing is proposed, voted
+    /// or accepted for it until the block arrives.
+    pub fn leader_after_parent(&self, round: Round, parent_qc: &QuorumCert) -> Option<NodeId> {
+        if !self.leader_mode.skips_absent() || parent_qc.round.0 == 0 {
+            return Some(self.leader(round));
+        }
+        let parent = self.tree.get(&parent_qc.block_id)?;
+        Some(
+            self.vset
+                .leader_after(round, self.leader_mode, Some(&parent.parent_qc)),
+        )
+    }
+
+    /// The leader that must have authored proposal block `b`.
+    pub fn proposal_leader(&self, b: &Block) -> Option<NodeId> {
+        self.leader_after_parent(b.round, &b.parent_qc)
+    }
+
+    /// The leader of the current round if this node proposed now, extending `high_qc`.
+    pub fn current_leader(&self) -> Option<NodeId> {
+        self.leader_after_parent(self.round, &self.high_qc)
+    }
+
+    /// Best-effort leaders of the next `count` rounds from the current one, for
+    /// forwarding transactions ahead of time. Each assumes the round extends the
+    /// current `high_qc`; a later certificate can change them.
+    pub fn upcoming_leaders(&self, count: usize) -> Vec<NodeId> {
+        (0..count as u64)
+            .map(|k| {
+                let r = Round(self.round.0 + k);
+                self.leader_after_parent(r, &self.high_qc)
+                    .unwrap_or_else(|| self.leader(r))
+            })
+            .collect()
     }
 
     /// set the leader-selection mode (a chain constant). Called at construction and

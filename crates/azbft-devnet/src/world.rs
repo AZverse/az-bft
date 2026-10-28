@@ -8,7 +8,7 @@ use crate::{DevnetConfig, DevnetError};
 use azbft_core::{AggScheme, Command, ConsensusCore, Event};
 use azbft_crypto::bls::BlsSecretKey;
 use azbft_crypto::keypair::Keypair;
-use azbft_types::{ConsensusMessage, Member, NodeId, Round, ValidatorSet};
+use azbft_types::{ConsensusMessage, LeaderSchedule, Member, NodeId, Round, ValidatorSet};
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,7 +29,11 @@ pub(crate) struct World {
 }
 
 impl World {
-    pub(crate) fn new(config: DevnetConfig, fault: DevnetFault) -> Result<Self, DevnetError> {
+    pub(crate) fn new(
+        config: DevnetConfig,
+        fault: DevnetFault,
+        schedule: LeaderSchedule,
+    ) -> Result<Self, DevnetError> {
         if config.validators < 4 {
             return Err(DevnetError::InvalidConfig(
                 "a public devnet requires at least four validators",
@@ -89,7 +93,7 @@ impl World {
             .copied()
             .enumerate()
             .map(|(index, seed)| {
-                let core = ConsensusCore::with_signer_scheme(
+                let mut core = ConsensusCore::with_signer_scheme(
                     0,
                     validator_set.clone(),
                     BASE_TIMER,
@@ -97,6 +101,7 @@ impl World {
                     operator_public_key.clone(),
                     AggScheme::Bls,
                 );
+                core.set_leader_mode(schedule);
                 NodeDriver::new(core, unavailable.contains(&index))
             })
             .collect::<Vec<_>>();

@@ -22,6 +22,10 @@ pub const MAX_BACKOFF_DOUBLINGS: u32 = 6;
 /// unbacked arms that round at base. Doubling still starts at the second
 /// consecutive timeout, so a round length too short for the load is still
 /// outgrown, one round later than before.
+///
+/// Votes now also go to the block's author, which certifies the predecessor's
+/// block itself, so only the crashed validator's own round expires per pass;
+/// that round is the one this keeps at base.
 pub const UNBACKED_TIMEOUTS: u32 = 1;
 
 pub struct Pacemaker {

@@ -10,6 +10,11 @@
 //!
 //! The reserved enum slot allows both schedules without changing the genesis
 //! canonical version.
+//!
+//! `RoundRobinSkipAbsent` and `StakeWeightedSkipAbsent` (blockchain#95) keep the
+//! base schedule but hand a round away from a validator that did not sign the
+//! liveness QC — the QC carried by the parent of the block being proposed. See
+//! `ValidatorSet::leader_after`.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
@@ -29,6 +34,11 @@ pub enum LeaderSchedule {
     /// integer point over the cumulative-stake buckets. A member with stake `S`
     /// leads with probability `S / total_stake`. Opt-in via genesis.
     StakeWeighted,
+    /// `RoundRobin`, skipping ahead past members absent from the liveness QC.
+    RoundRobinSkipAbsent,
+    /// `StakeWeighted`, re-mapping the same point over the stakes of the members
+    /// present in the liveness QC when the base leader is absent from it.
+    StakeWeightedSkipAbsent,
 }
 
 impl LeaderSchedule {
@@ -38,6 +48,28 @@ impl LeaderSchedule {
         match self {
             LeaderSchedule::RoundRobin => 0,
             LeaderSchedule::StakeWeighted => 1,
+            LeaderSchedule::RoundRobinSkipAbsent => 2,
+            LeaderSchedule::StakeWeightedSkipAbsent => 3,
+        }
+    }
+
+    /// True for the schedules that skip validators absent from the liveness QC.
+    pub fn skips_absent(self) -> bool {
+        matches!(
+            self,
+            LeaderSchedule::RoundRobinSkipAbsent | LeaderSchedule::StakeWeightedSkipAbsent
+        )
+    }
+
+    /// The schedule a skip-absent mode falls back to (and itself for the others).
+    pub fn base(self) -> LeaderSchedule {
+        match self {
+            LeaderSchedule::RoundRobin | LeaderSchedule::RoundRobinSkipAbsent => {
+                LeaderSchedule::RoundRobin
+            }
+            LeaderSchedule::StakeWeighted | LeaderSchedule::StakeWeightedSkipAbsent => {
+                LeaderSchedule::StakeWeighted
+            }
         }
     }
 }
@@ -49,8 +81,11 @@ impl std::str::FromStr for LeaderSchedule {
         match s {
             "round_robin" => Ok(LeaderSchedule::RoundRobin),
             "stake_weighted" => Ok(LeaderSchedule::StakeWeighted),
+            "round_robin_skip_absent" => Ok(LeaderSchedule::RoundRobinSkipAbsent),
+            "stake_weighted_skip_absent" => Ok(LeaderSchedule::StakeWeightedSkipAbsent),
             other => Err(format!(
-                "unknown leader_schedule '{other}' (expected: round_robin | stake_weighted)"
+                "unknown leader_schedule '{other}' (expected: round_robin | stake_weighted | \
+                 round_robin_skip_absent | stake_weighted_skip_absent)"
             )),
         }
     }
@@ -71,6 +106,14 @@ mod tests {
             LeaderSchedule::from_str("stake_weighted").unwrap(),
             LeaderSchedule::StakeWeighted
         );
+        assert_eq!(
+            LeaderSchedule::from_str("round_robin_skip_absent").unwrap(),
+            LeaderSchedule::RoundRobinSkipAbsent
+        );
+        assert_eq!(
+            LeaderSchedule::from_str("stake_weighted_skip_absent").unwrap(),
+            LeaderSchedule::StakeWeightedSkipAbsent
+        );
         assert!(LeaderSchedule::from_str("bogus").is_err());
     }
 
@@ -80,6 +123,23 @@ mod tests {
         // change every chain's genesis hash.
         assert_eq!(LeaderSchedule::RoundRobin.to_u8(), 0);
         assert_eq!(LeaderSchedule::StakeWeighted.to_u8(), 1);
+        assert_eq!(LeaderSchedule::RoundRobinSkipAbsent.to_u8(), 2);
+        assert_eq!(LeaderSchedule::StakeWeightedSkipAbsent.to_u8(), 3);
+    }
+
+    #[test]
+    fn skip_absent_modes_fall_back_to_their_base() {
+        assert!(!LeaderSchedule::RoundRobin.skips_absent());
+        assert!(!LeaderSchedule::StakeWeighted.skips_absent());
+        assert_eq!(
+            LeaderSchedule::RoundRobinSkipAbsent.base(),
+            LeaderSchedule::RoundRobin
+        );
+        assert_eq!(
+            LeaderSchedule::StakeWeightedSkipAbsent.base(),
+            LeaderSchedule::StakeWeighted
+        );
+        assert!(LeaderSchedule::RoundRobinSkipAbsent.skips_absent());
     }
 
     #[test]

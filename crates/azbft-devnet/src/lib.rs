@@ -65,5 +65,15 @@ pub fn run_devnet_with_fault(
     config: DevnetConfig,
     fault: DevnetFault,
 ) -> Result<DevnetTranscript, DevnetError> {
-    world::World::new(config, fault)?.run()
+    run_devnet_with_schedule(config, fault, azbft_types::LeaderSchedule::RoundRobin)
+}
+
+/// `run_devnet_with_fault` under a chosen leader schedule (a chain constant, so
+/// every validator gets the same one).
+pub fn run_devnet_with_schedule(
+    config: DevnetConfig,
+    fault: DevnetFault,
+    schedule: azbft_types::LeaderSchedule,
+) -> Result<DevnetTranscript, DevnetError> {
+    world::World::new(config, fault, schedule)?.run()
 }

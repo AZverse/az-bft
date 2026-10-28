@@ -57,6 +57,16 @@ impl AggSig {
     pub fn secp(sigs: Vec<(NodeId, Vec<u8>)>) -> Self {
         AggSig::Secp(sigs)
     }
+
+    /// The validators named as signers, in encoded order. Says nothing about
+    /// whether the aggregate verifies: callers that act on it use a QC that was
+    /// verified when it entered the block tree.
+    pub fn signers(&self) -> Vec<NodeId> {
+        match self {
+            AggSig::Secp(sigs) => sigs.iter().map(|(n, _)| *n).collect(),
+            AggSig::Bls(agg) => agg.signers.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
