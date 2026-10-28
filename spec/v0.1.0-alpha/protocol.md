@@ -22,6 +22,31 @@ The leader schedule is a chain constant committed by genesis.
 - `round_robin` selects `members[round mod member_count]`.
 - `stake_weighted` hashes the round to an integer point in `[0, W)` and selects
   the corresponding cumulative-stake bucket. It uses integer arithmetic only.
+- `round_robin_skip_absent` and `stake_weighted_skip_absent` (genesis values 2
+  and 3) start from the base schedule above and move the rounds of validators
+  that are missing from the *liveness QC*.
+
+The liveness QC of a proposal at round `r` is the parent QC carried by the block
+the proposal extends (the grandparent certificate). Let `E` be the members of
+the epoch's set named as signers of that QC. If there is no liveness QC (the
+proposal extends genesis or a block carrying the genesis QC), or `E` is empty,
+the base leader leads. Otherwise:
+
+- if the base leader is in `E`, it leads;
+- under `round_robin_skip_absent`, the first `members[(r + k) mod n]`,
+  `k = 1, 2, ...`, that is in `E` leads;
+- under `stake_weighted_skip_absent`, the same round point is taken modulo the
+  total stake of `E` and mapped over the cumulative stakes of `E`'s members in
+  `NodeId` order.
+
+The leader of a round therefore depends on the branch being extended. A
+receiver checks a proposal's author against the leader computed from its own
+parent block; a validator that does not hold that block cannot compute it and
+does not vote until the block is recovered. The base schedules ignore the
+liveness QC.
+
+A validator that signs QCs slowly can lose rounds under a skip-absent schedule,
+because a QC needs only a quorum and need not name every live validator.
 
 Every validator in an epoch MUST use the same schedule and validator set.
 
@@ -62,7 +87,13 @@ block.parent_qc.round >= preferred_round
 ```
 
 Before emitting the vote, the core advances `last_voted_round` and emits the
-new safety snapshot for durable persistence. Processing a certified block
+new safety snapshot for durable persistence.
+
+The vote is sent to the leader of `block.round + 1` extending this block, and
+also to the block's author when that is a different validator. Any validator
+that collects a quorum of votes forms the QC. If the next leader is down, the
+author still certifies its block and carries the QC as `high_qc` in its timeout,
+so the timeout certificate extends the block instead of discarding it. Processing a certified block
 raises `preferred_round` monotonically to at least the parent-QC round.
 
 A local timeout also advances `last_voted_round` to the timed-out round before
@@ -111,10 +142,9 @@ not progress and carries the backoff over, so the timer keeps growing while
 rounds keep expiring. The timer stops growing after six doublings, at 64 times
 the base, which also bounds how long recovery waits once rounds stop expiring.
 
-The first timeout is left unbacked because one crashed validator expires two
-consecutive rounds on every pass of the round-robin schedule: its own, and its
-predecessor's, whose votes are addressed to it as the next leader. Both of
-those rounds run on the base timer.
+The first timeout is left unbacked because one crashed validator expires its
+own round on every pass of the round-robin schedule, and that round must run on
+the base timer.
 
 Verified timeouts are deduplicated by sender and weighted by stake. Weight
 exceeding the maximum Byzantine weight causes an honest validator that is

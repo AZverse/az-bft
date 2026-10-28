@@ -415,7 +415,7 @@ impl ConsensusCore {
     /// On entering a round: if this node is its leader, request a payload to
     /// propose; always (re)arm the round timer.
     pub(crate) fn enter_round(&mut self, r: Round, out: &mut Vec<Command>) {
-        if self.leader(r) == self.me {
+        if self.leader_after_parent(r, &self.high_qc) == Some(self.me) {
             out.push(Command::CreatePayload {
                 round: r,
                 parent: self.high_qc.clone(),
@@ -426,7 +426,7 @@ impl ConsensusCore {
 
     /// Proposal path: verify author, store the block, absorb its parent QC
     /// (which may commit + advance), then run rule 1 — if we may vote, send the
-    /// vote to the *next* round's leader and arm our timer.
+    /// vote to the *next* round's leader and to the block's author, and arm our timer.
     pub(crate) fn on_proposal(&mut self, sp: Signed<Proposal>, now: LogicalTime) -> Vec<Command> {
         let mut out = Vec::new();
         let prop = sp.inner;
@@ -437,8 +437,12 @@ impl ConsensusCore {
         }
 
         // The proposal must come from this round's leader, and its embedded
-        // block must name that leader as author.
-        let leader = self.leader(b.round);
+        // block must name that leader as author. Under a skip-absent schedule the
+        // leader depends on the parent block; an unknown parent leaves it unknown
+        // and the proposal is dropped (the host's unknown-parent recovery applies).
+        let Some(leader) = self.proposal_leader(&b) else {
+            return out;
+        };
         let Some(pk) = self.vset.pubkey_of(&leader).map(|p| p.to_vec()) else {
             return out;
         };
@@ -625,11 +629,21 @@ impl ConsensusCore {
                 AggScheme::Secp => self.signer.sign(Domain::Vote, &vd.0),
                 AggScheme::Bls => self.signer.sign_bls_vote(&vd.0),
             };
-            let next = self.leader(Round(b.round.0 + 1));
-            out.push(Command::Send(
-                next,
-                ConsensusMessage::Vote(Signed { inner: vote, sig }),
-            ));
+            // The next leader extends `b`, so its liveness QC is `b.parent_qc`, which
+            // is known now — before any QC on `b` exists.
+            let next =
+                self.vset
+                    .leader_after(Round(b.round.0 + 1), self.leader_mode, Some(&b.parent_qc));
+            let vote = ConsensusMessage::Vote(Signed { inner: vote, sig });
+            // Also give the vote to the block's own leader (monad-bft routes votes
+            // to the current and the next leader). Any collector that reaches quorum
+            // forms the QC, so if the next leader is down the current one still
+            // certifies `b`, enters the next round and carries the QC in its
+            // timeout's `high_qc`: the TC then extends `b` instead of dropping it.
+            if b.author != next {
+                out.push(Command::Send(b.author, vote.clone()));
+            }
+            out.push(Command::Send(next, vote));
         }
         out
     }
@@ -739,7 +753,10 @@ impl ConsensusCore {
         parent: &QuorumCert,
         now: LogicalTime,
     ) -> Option<ProposalBuildContext> {
-        if round != self.round || self.leader(round) != self.me || parent != &self.high_qc {
+        if round != self.round
+            || self.leader_after_parent(round, parent) != Some(self.me)
+            || parent != &self.high_qc
+        {
             return None;
         }
         let parent_anchor = if parent.round.0 == 0 {
@@ -772,7 +789,7 @@ impl ConsensusCore {
         // high-QC changes. It must never attach to the newer consensus state.
         if context.epoch != self.epoch
             || context.round != self.round
-            || self.leader(context.round) != self.me
+            || self.leader_after_parent(context.round, &context.parent) != Some(self.me)
             || context.proposer != self.me
             || context.parent != self.high_qc
         {
@@ -4398,5 +4415,250 @@ mod tests {
             !core.consumed_evidence().contains(&key),
             "only the two-chain commit target may consume evidence"
         );
+    }
+
+    // ---- blockchain#95: votes to author + next leader; skip-absent leaders ----
+
+    /// A QC over `(block_id, round)` signed by exactly `signers`.
+    fn qc_by(block_id: Hash, round: Round, signers: &[&Keypair]) -> QuorumCert {
+        let sigs: Vec<(NodeId, Vec<u8>)> = signers
+            .iter()
+            .map(|k| {
+                (
+                    k.node_id(),
+                    k.sign(Domain::Vote, &vote_digest(&block_id, round).0),
+                )
+            })
+            .collect();
+        QuorumCert {
+            block_id,
+            round,
+            agg: SecpMultiSig::aggregate(&sigs),
+        }
+    }
+
+    fn vote_targets(out: &[Command]) -> Vec<NodeId> {
+        out.iter()
+            .filter_map(|c| match c {
+                Command::Send(to, ConsensusMessage::Vote(_)) => Some(*to),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A vote goes to the next leader, which forms the QC on the happy path, and
+    /// also to the block's author. If the next leader is down the author still
+    /// certifies the block and carries that QC into the timeouts, so the block is
+    /// not orphaned by the view change.
+    #[test]
+    fn vote_goes_to_the_block_author_and_the_next_leader() {
+        let (kps, vset) = validators();
+        let leader1 = vset.leader(Round(1));
+        let leader2 = vset.leader(Round(2));
+        let me_idx = kps
+            .iter()
+            .position(|k| k.node_id() != leader1 && k.node_id() != leader2)
+            .unwrap();
+        let mut core = core_as(&vset, me_idx);
+        let b = block_round1(leader1, b"payload-1");
+        let out = core.handle(
+            Event::Proposal(sign_proposal(
+                kp_of(&kps, leader1),
+                &Proposal {
+                    block: b,
+                    last_round_tc: None,
+                },
+            )),
+            0,
+        );
+        let mut targets = vote_targets(&out);
+        targets.sort();
+        let mut want = vec![leader1, leader2];
+        want.sort();
+        assert_eq!(
+            targets, want,
+            "one vote each to the author and the next leader"
+        );
+    }
+
+    /// The author's copy of the vote is enough to certify its own block: with the
+    /// next leader silent, the author collects a quorum, forms the QC and moves on
+    /// with it as `high_qc`.
+    #[test]
+    fn the_author_certifies_its_block_from_the_extra_votes() {
+        let (kps, vset) = validators();
+        let leader1 = vset.leader(Round(1));
+        let author_idx = kps.iter().position(|k| k.node_id() == leader1).unwrap();
+        let mut author = core_as(&vset, author_idx);
+        author.start();
+        let b = block_round1(leader1, b"payload-1");
+        author.tree_insert_for_test(b.clone());
+        for kp in kps.iter().filter(|k| k.node_id() != vset.leader(Round(2))) {
+            let vote = Vote {
+                epoch: 0,
+                block_id: b.id(),
+                round: Round(1),
+                voter: kp.node_id(),
+            };
+            author.handle(Event::Vote(sign_vote(kp, &vote)), 0);
+        }
+        assert_eq!(author.high_qc().block_id, b.id());
+        assert_eq!(author.round(), Round(2));
+    }
+
+    /// Four validators where `absent` signs nothing. Returns `(b1, b2)` with b2's
+    /// parent QC (the liveness QC of round 3) signed by the other three.
+    fn chain_without(kps: &[Keypair], vset: &ValidatorSet, absent: NodeId) -> (Block, Block) {
+        let present: Vec<&Keypair> = kps.iter().filter(|k| k.node_id() != absent).collect();
+        let b1 = block_round1(vset.leader(Round(1)), b"b1");
+        let b2 = Block {
+            height: 2,
+            timestamp_ms: 2,
+            round: Round(2),
+            parent_qc: qc_by(b1.id(), Round(1), &present),
+            payload_hash: blake3_id(&b"b2".to_vec()),
+            author: vset.leader(Round(2)),
+            ..b1.clone()
+        };
+        (b1, b2)
+    }
+
+    fn round3_block(kps: &[Keypair], b2: &Block, author: NodeId, absent: NodeId) -> Block {
+        let present: Vec<&Keypair> = kps.iter().filter(|k| k.node_id() != absent).collect();
+        Block {
+            height: 3,
+            timestamp_ms: 3,
+            round: Round(3),
+            parent_qc: qc_by(b2.id(), Round(2), &present),
+            payload_hash: blake3_id(&b"b3".to_vec()),
+            author,
+            ..b2.clone()
+        }
+    }
+
+    /// Under round_robin_skip_absent the round of a validator missing from the
+    /// liveness QC belongs to the next member in schedule order: its own proposal
+    /// is refused and the skip leader's is voted. The same proposal from the
+    /// absent base leader is voted under plain round robin (control).
+    #[test]
+    fn skip_absent_round_belongs_to_the_next_present_member() {
+        let (kps, vset) = validators();
+        let absent = vset.leader(Round(3));
+        let skip = vset.leader(Round(4));
+        let (b1, b2) = chain_without(&kps, &vset, absent);
+        let me_idx = kps
+            .iter()
+            .position(|k| k.node_id() != absent && k.node_id() != skip)
+            .unwrap();
+        let propose = |mode: LeaderSchedule, author: NodeId| {
+            let mut core = core_as(&vset, me_idx);
+            core.set_leader_mode(mode);
+            core.tree_insert_for_test(b1.clone());
+            core.tree_insert_for_test(b2.clone());
+            let b3 = round3_block(&kps, &b2, author, absent);
+            core.handle(
+                Event::Proposal(sign_proposal(
+                    kp_of(&kps, author),
+                    &Proposal {
+                        block: b3,
+                        last_round_tc: None,
+                    },
+                )),
+                0,
+            )
+        };
+        assert!(has_vote(&propose(LeaderSchedule::RoundRobin, absent)));
+        assert!(!has_vote(&propose(
+            LeaderSchedule::RoundRobinSkipAbsent,
+            absent
+        )));
+        assert!(has_vote(&propose(
+            LeaderSchedule::RoundRobinSkipAbsent,
+            skip
+        )));
+        assert!(!has_vote(&propose(LeaderSchedule::RoundRobin, skip)));
+    }
+
+    /// The skip leader is the one that builds round 3: the votes on b2 are routed
+    /// to it (b2's parent QC already shows the absence), it forms the QC, and on
+    /// entering round 3 it asks for a payload. The absent base leader would not.
+    #[test]
+    fn skip_leader_collects_the_votes_and_builds_the_round() {
+        let (kps, vset) = validators();
+        let absent = vset.leader(Round(3));
+        let skip = vset.leader(Round(4));
+        let (b1, b2) = chain_without(&kps, &vset, absent);
+
+        // a replica voting on b2 routes to the skip leader and to b2's author
+        let voter_idx = kps
+            .iter()
+            .position(|k| k.node_id() != absent && k.node_id() != skip && k.node_id() != b2.author)
+            .unwrap();
+        let mut voter = core_as(&vset, voter_idx);
+        voter.set_leader_mode(LeaderSchedule::RoundRobinSkipAbsent);
+        voter.tree_insert_for_test(b1.clone());
+        let out = voter.handle(
+            Event::Proposal(sign_proposal(
+                kp_of(&kps, b2.author),
+                &Proposal {
+                    block: b2.clone(),
+                    last_round_tc: None,
+                },
+            )),
+            0,
+        );
+        let targets = vote_targets(&out);
+        assert!(
+            targets.contains(&skip) && !targets.contains(&absent),
+            "{targets:?}"
+        );
+
+        let skip_idx = kps.iter().position(|k| k.node_id() == skip).unwrap();
+        let mut leader = core_as(&vset, skip_idx);
+        leader.set_leader_mode(LeaderSchedule::RoundRobinSkipAbsent);
+        leader.start();
+        leader.tree_insert_for_test(b1.clone());
+        leader.tree_insert_for_test(b2.clone());
+        let mut out = Vec::new();
+        for kp in kps.iter().filter(|k| k.node_id() != absent) {
+            let vote = Vote {
+                epoch: 0,
+                block_id: b2.id(),
+                round: Round(2),
+                voter: kp.node_id(),
+            };
+            out.extend(leader.handle(Event::Vote(sign_vote(kp, &vote)), 0));
+        }
+        assert_eq!(leader.round(), Round(3));
+        assert!(
+            out.iter()
+                .any(|c| matches!(c, Command::CreatePayload { round, .. } if *round == Round(3))),
+            "the skip leader builds round 3; got {out:?}"
+        );
+        let parent = leader.high_qc().clone();
+        assert!(leader
+            .proposal_build_context(Round(3), &parent, 0)
+            .is_some());
+        assert_eq!(leader.current_leader(), Some(skip));
+    }
+
+    /// Ancestry import checks each author against the parent it extends: the
+    /// third block's liveness QC is the second block's parent QC.
+    #[test]
+    fn ancestry_import_checks_skip_absent_authors() {
+        let (kps, vset) = validators();
+        let absent = vset.leader(Round(3));
+        let skip = vset.leader(Round(4));
+        let (b1, b2) = chain_without(&kps, &vset, absent);
+        let present: Vec<&Keypair> = kps.iter().filter(|k| k.node_id() != absent).collect();
+        let import = |author: NodeId| {
+            let mut core = core_as(&vset, 0);
+            core.set_leader_mode(LeaderSchedule::RoundRobinSkipAbsent);
+            let b3 = round3_block(&kps, &b2, author, absent);
+            let target = qc_by(b3.id(), Round(3), &present);
+            core.import_live_ancestors(&[b1.clone(), b2.clone(), b3], &target)
+        };
+        assert_eq!(import(absent), Err("invalid ancestry author"));
+        assert_eq!(import(skip), Ok(()));
     }
 }

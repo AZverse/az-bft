@@ -1,3 +1,4 @@
+use crate::cert::QuorumCert;
 use crate::ids::{blake3_id, NodeId, Round};
 use crate::leader_schedule::LeaderSchedule;
 use borsh::{BorshDeserialize, BorshSerialize};
@@ -177,10 +178,77 @@ impl ValidatorSet {
     /// [`leader_weighted`](Self::leader_weighted). The `mode` is a shared chain constant
     /// passed in by the caller — it is never stored on the wire `ValidatorSet`.
     pub fn leader_with_mode(&self, round: Round, mode: LeaderSchedule) -> NodeId {
-        match mode {
-            LeaderSchedule::RoundRobin => self.leader(round),
+        match mode.base() {
             LeaderSchedule::StakeWeighted => self.leader_weighted(round),
+            _ => self.leader(round),
         }
+    }
+
+    /// Leader for `round` given the **liveness QC** — the QC carried by the
+    /// parent of the block proposed at `round` (blockchain#95). For the base
+    /// schedules, and when there is no liveness QC (`None`, or the genesis QC), this
+    /// is [`leader_with_mode`](Self::leader_with_mode).
+    ///
+    /// For the skip-absent schedules, let `E` be the members of this set that
+    /// signed the liveness QC. An empty `E` (genesis, an epoch start, a QC from
+    /// another set) keeps the base schedule. Otherwise:
+    /// - round robin: the base leader leads if it is in `E`, else the first
+    ///   `members[(round + k) mod n]` in `E`, so only the turns of absent members
+    ///   move;
+    /// - stake weighted: the base leader leads if it is in `E`, else the same
+    ///   `blake3(round)` point is mapped over the cumulative stakes of `E`.
+    ///
+    /// Deterministic: the inputs are the round, this set and a QC fixed by the
+    /// proposed block's ancestry, so every node verifying the same proposal
+    /// computes the same leader.
+    pub fn leader_after(
+        &self,
+        round: Round,
+        mode: LeaderSchedule,
+        liveness: Option<&QuorumCert>,
+    ) -> NodeId {
+        let base = self.leader_with_mode(round, mode);
+        let Some(qc) = liveness.filter(|q| mode.skips_absent() && q.round.0 != 0) else {
+            return base;
+        };
+        let signers = qc.agg.signers();
+        let eligible = |id: &NodeId| signers.contains(id);
+        if !self.members.iter().any(|m| eligible(&m.node_id)) || eligible(&base) {
+            return base;
+        }
+        match mode.base() {
+            LeaderSchedule::StakeWeighted => {
+                let total: u128 = self
+                    .members
+                    .iter()
+                    .filter(|m| eligible(&m.node_id))
+                    .map(|m| m.stake as u128)
+                    .sum();
+                if total > 0 {
+                    let h = blake3_id(&round.0);
+                    let point =
+                        u128::from_le_bytes(h.0[..16].try_into().expect("32-byte hash")) % total;
+                    let mut cum: u128 = 0;
+                    for m in self.members.iter().filter(|m| eligible(&m.node_id)) {
+                        cum += m.stake as u128;
+                        if point < cum {
+                            return m.node_id;
+                        }
+                    }
+                }
+                self.skip_ahead(round, &eligible)
+            }
+            _ => self.skip_ahead(round, &eligible),
+        }
+    }
+
+    fn skip_ahead(&self, round: Round, eligible: &impl Fn(&NodeId) -> bool) -> NodeId {
+        let n = self.members.len();
+        let start = (round.0 % n as u64) as usize;
+        (0..n)
+            .map(|k| self.members[(start + k) % n].node_id)
+            .find(|id| eligible(id))
+            .unwrap_or_else(|| self.leader(round))
     }
 
     /// [`upcoming_leaders`](Self::upcoming_leaders) under `mode`.
@@ -472,5 +540,123 @@ mod tests {
             Some([0xbb; 48].as_slice())
         );
         assert_eq!(v.bls_pop_of(&NodeId([1; 20])), Some([0xcc; 96].as_slice()));
+    }
+
+    /// A liveness QC at `round` signed by exactly `signers` (signatures are not
+    /// checked by `leader_after`; only the named signer set matters).
+    fn liveness(round: u64, signers: &[u8]) -> QuorumCert {
+        QuorumCert {
+            block_id: blake3_id(&round),
+            round: Round(round),
+            agg: crate::cert::AggSig::Secp(
+                signers.iter().map(|&i| (NodeId([i; 20]), vec![])).collect(),
+            ),
+        }
+    }
+
+    #[test]
+    fn round_robin_skip_absent_moves_only_the_absent_members_turns() {
+        let v = vs(4);
+        let mode = LeaderSchedule::RoundRobinSkipAbsent;
+        for absent in 0..4u8 {
+            let present: Vec<u8> = (0..4).filter(|&i| i != absent).collect();
+            let qc = liveness(7, &present);
+            for r in 1..40u64 {
+                let base = v.leader(Round(r));
+                let got = v.leader_after(Round(r), mode, Some(&qc));
+                if base == NodeId([absent; 20]) {
+                    // the next member in schedule order takes the turn
+                    assert_eq!(got, v.leader(Round(r + 1)), "round {r}, absent {absent}");
+                } else {
+                    assert_eq!(got, base, "a present base leader keeps its round {r}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn round_robin_skip_absent_skips_several_absent_members_in_order() {
+        let v = vs(7);
+        // members 2 and 3 absent: round 2 and round 3 both go to member 4
+        let qc = liveness(9, &[0, 1, 4, 5, 6]);
+        let mode = LeaderSchedule::RoundRobinSkipAbsent;
+        assert_eq!(v.leader_after(Round(2), mode, Some(&qc)), NodeId([4; 20]));
+        assert_eq!(v.leader_after(Round(3), mode, Some(&qc)), NodeId([4; 20]));
+        assert_eq!(v.leader_after(Round(4), mode, Some(&qc)), NodeId([4; 20]));
+        assert_eq!(v.leader_after(Round(1), mode, Some(&qc)), NodeId([1; 20]));
+    }
+
+    #[test]
+    fn skip_absent_without_a_usable_liveness_qc_keeps_the_base_schedule() {
+        let v = vs_staked(&[1, 2, 3, 4]);
+        let unknown_signers = QuorumCert {
+            agg: crate::cert::AggSig::Secp(vec![(NodeId([99; 20]), vec![])]),
+            ..liveness(5, &[])
+        };
+        for (mode, base) in [
+            (
+                LeaderSchedule::RoundRobinSkipAbsent,
+                LeaderSchedule::RoundRobin,
+            ),
+            (
+                LeaderSchedule::StakeWeightedSkipAbsent,
+                LeaderSchedule::StakeWeighted,
+            ),
+        ] {
+            for r in 0..30u64 {
+                let want = v.leader_with_mode(Round(r), base);
+                assert_eq!(v.leader_with_mode(Round(r), mode), want);
+                assert_eq!(v.leader_after(Round(r), mode, None), want, "no liveness QC");
+                assert_eq!(
+                    v.leader_after(Round(r), mode, Some(&QuorumCert::genesis())),
+                    want,
+                    "the genesis QC names no signers"
+                );
+                assert_eq!(
+                    v.leader_after(Round(r), mode, Some(&unknown_signers)),
+                    want,
+                    "signers from another set leave E empty"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn base_schedules_ignore_the_liveness_qc() {
+        let v = vs_staked(&[1, 2, 3, 4]);
+        let qc = liveness(3, &[0]);
+        for r in 0..30u64 {
+            assert_eq!(
+                v.leader_after(Round(r), LeaderSchedule::RoundRobin, Some(&qc)),
+                v.leader(Round(r))
+            );
+            assert_eq!(
+                v.leader_after(Round(r), LeaderSchedule::StakeWeighted, Some(&qc)),
+                v.leader_weighted(Round(r))
+            );
+        }
+    }
+
+    #[test]
+    fn stake_weighted_skip_absent_never_picks_an_absent_member_and_keeps_present_ones() {
+        let v = vs_staked(&[5, 1, 3, 2]);
+        let mode = LeaderSchedule::StakeWeightedSkipAbsent;
+        let qc = liveness(11, &[1, 2, 3]); // the heaviest member 0 is absent
+        let mut moved = 0;
+        let mut counts = [0u32; 4];
+        for r in 0..600u64 {
+            let base = v.leader_weighted(Round(r));
+            let got = v.leader_after(Round(r), mode, Some(&qc));
+            assert_ne!(got, NodeId([0; 20]), "round {r} went to the absent member");
+            if base != NodeId([0; 20]) {
+                assert_eq!(got, base, "a present base leader keeps round {r}");
+            } else {
+                moved += 1;
+            }
+            counts[got.0[0] as usize] += 1;
+        }
+        assert!(moved > 0, "the absent member led some base rounds");
+        // remapped rounds follow the present stakes 1:3:2, so member 2 leads most
+        assert!(counts[2] > counts[3] && counts[3] > counts[1], "{counts:?}");
     }
 }

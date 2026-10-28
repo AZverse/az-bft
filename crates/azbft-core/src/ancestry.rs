@@ -76,7 +76,24 @@ impl ConsensusCore {
             if block.epoch != self.epoch || block.reconfig.is_some() {
                 return Err("epoch transition requires committed recovery");
             }
-            if block.author != self.leader(block.round) {
+            // The author is checked against the parent the block actually extends:
+            // the anchor (already in the tree) for the first block, the previous
+            // batch block after that. That parent's own parent QC is the liveness QC.
+            let liveness = if index == 0 {
+                if block.parent_qc.round.0 == 0 {
+                    None
+                } else {
+                    self.tree
+                        .get(&block.parent_qc.block_id)
+                        .map(|anchor| anchor.parent_qc.clone())
+                }
+            } else {
+                Some(blocks[index - 1].parent_qc.clone())
+            };
+            let expected = self
+                .vset
+                .leader_after(block.round, self.leader_mode, liveness.as_ref());
+            if block.author != expected {
                 return Err("invalid ancestry author");
             }
             if block.round <= block.parent_qc.round {
