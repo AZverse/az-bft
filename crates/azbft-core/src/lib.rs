@@ -17,6 +17,7 @@ pub use evidence::{
 };
 pub use pacemaker::*;
 pub use reconfig::{
-    verify_checkpoint, verify_commit_cert, verify_epoch_change_cert, verify_two_chain_commit,
+    is_execution_reconfig, verify_checkpoint, verify_commit_cert, verify_epoch_change_cert,
+    verify_two_chain_commit,
 };
 pub use state::*;

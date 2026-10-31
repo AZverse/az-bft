@@ -157,6 +157,12 @@ pub struct ConsensusCore {
     /// reconstructed on checkpoint-adopt, applied on sync/gossip catch-up, persisted
     /// across restart), but simpler: insert-only needs no `vset` at the catch-up sites.
     pub(crate) consumed_evidence: BTreeSet<(NodeId, u64, u64)>,
+    /// First block height whose reconfiguration is authorized by execution
+    /// rather than by an operator: from here a `Reconfig` carries no operator
+    /// signature, evidence or jail record, and may admit new members. The host
+    /// checks that it names the set its own execution derived; the core checks
+    /// only the shape. `None` keeps operator authorization at every height.
+    pub(crate) execution_reconfig_from: Option<u64>,
 }
 
 impl ConsensusCore {
@@ -276,6 +282,7 @@ impl ConsensusCore {
             jailed: BTreeMap::new(),
             consumed_evidence: BTreeSet::new(),
             leader_mode: LeaderSchedule::default(),
+            execution_reconfig_from: None,
         }
     }
 
@@ -455,6 +462,17 @@ impl ConsensusCore {
                     .unwrap_or_else(|| self.leader(r))
             })
             .collect()
+    }
+
+    /// Hand reconfiguration authority to execution from block `height` on.
+    /// A chain constant once known; the host re-applies it on every epoch roll.
+    pub fn set_execution_reconfig_from(&mut self, height: u64) {
+        self.execution_reconfig_from = Some(height);
+    }
+
+    /// The height set by [`set_execution_reconfig_from`](Self::set_execution_reconfig_from).
+    pub fn execution_reconfig_from(&self) -> Option<u64> {
+        self.execution_reconfig_from
     }
 
     /// set the leader-selection mode (a chain constant). Called at construction and

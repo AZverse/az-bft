@@ -5,6 +5,19 @@ Semantic Versioning for source releases, including prerelease identifiers.
 
 ## [Unreleased]
 
+### Added
+
+- Execution-owned validator sets. After
+  `ConsensusCore::set_execution_reconfig_from(h)`, a reconfiguration in a block
+  at height `h` or above is authorized only in the execution shape: no operator
+  signature, no evidence, no jail record and a non-empty next set. It may admit
+  validators that are not in the current set; proofs of possession are still
+  required. Below `h`, and when the height is never set, operator and evidence
+  authorization are unchanged. `Event::RequestExecutionReconfig(set)` stages
+  such a reconfiguration for the leader's next block. The core checks only the
+  shape: the host decides at which heights a block carries one and that the set
+  is the one its execution derived.
+
 ### Fixed
 
 - The pacemaker backoff is no longer reset when a round is left by timeout

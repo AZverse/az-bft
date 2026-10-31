@@ -31,6 +31,10 @@ pub enum Event {
     /// Stages an operator-authorized temporary removal. The supplied set must
     /// exclude the offender and the jail terms are covered by the signature.
     RequestJail(ValidatorSet, Vec<u8>, JailRecord),
+    /// Stages the set the host's execution derived for the coming epoch. It
+    /// carries no operator signature and is ignored until the host has set
+    /// [`ConsensusCore::set_execution_reconfig_from`](crate::ConsensusCore::set_execution_reconfig_from).
+    RequestExecutionReconfig(ValidatorSet),
     /// Applies an already verified committed chain segment through the normal
     /// QC-processing path.
     SyncApply {
