@@ -478,12 +478,13 @@ impl ConsensusCore {
             // From the execution handover height the set is execution's: no
             // operator path, and the host has already checked it names the set
             // its own execution derived. New members are what it is for.
-            // A retry of a transition certified before the handover keeps
-            // the rules it was certified under; refusing it would leave the
-            // locked epoch with no way to end.
-            let locked_retry =
-                self.epoch_ending_round.is_some() && self.pending_reconfig.as_ref() == Some(rc);
-            let execution_owned = !locked_retry
+            // A retry of an operator transition certified before the handover
+            // keeps the rules it was certified under; refusing it would leave
+            // the locked epoch with no way to end.
+            let locked_operator_retry = self.epoch_ending_round.is_some()
+                && self.pending_reconfig.as_ref() == Some(rc)
+                && !crate::reconfig::is_execution_reconfig(rc);
+            let execution_owned = !locked_operator_retry
                 && self
                     .execution_reconfig_from
                     .is_some_and(|from| b.height >= from);
@@ -4108,6 +4109,22 @@ mod tests {
             _ => None,
         });
         assert_eq!(carried, Some(Some(signed)));
+    }
+
+    /// A certified execution transition, new members and all, is retried
+    /// under the execution rules.
+    #[test]
+    fn a_locked_execution_transition_is_retried() {
+        let (kps, vset) = validators();
+        let rc = execution_reconfig(execution_next_set(&kps));
+        let mut locked = execution_follower(&kps, &vset, Some(1));
+        locked.pending_reconfig = Some(rc.clone());
+        locked.epoch_ending_round = Some(Round(0));
+        let out = locked.handle(
+            Event::Proposal(make_reconfig_proposal(&kps, &vset, rc, b"retry")),
+            0,
+        );
+        assert!(voted(&out), "{out:?}");
     }
 
     /// A certified transition is locked: a later execution request cannot replace it.
