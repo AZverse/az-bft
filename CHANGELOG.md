@@ -17,6 +17,11 @@ Semantic Versioning for source releases, including prerelease identifiers.
   such a reconfiguration for the leader's next block. The core checks only the
   shape: the host decides at which heights a block carries one and that the set
   is the one its execution derived.
+- From `h`, a leader drops an operator or evidence reconfiguration it staged
+  earlier instead of proposing it. A transition already certified below `h`
+  keeps its rules: its retries at `h` or above are still proposed and voted, so
+  the epoch it ends can close. `ConsensusCore::locked_reconfig()` exposes that
+  certified transition to the host.
 
 ### Fixed
 

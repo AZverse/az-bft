@@ -169,4 +169,7 @@ names a non-empty set whose BLS keys all have valid proofs of possession; it may
 admit validators outside the current set. Which heights carry a reconfiguration
 and which set it names are execution's decision, checked by the Host before the
 proposal reaches the core. Below `h` the operator and evidence rules apply
-unchanged.
+unchanged. A transition certified below `h` is retried under the rules it was
+certified under, at any height, until it commits; any other operator or
+evidence reconfiguration staged before `h` is dropped from blocks at `h` or
+above.

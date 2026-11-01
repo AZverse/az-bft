@@ -478,9 +478,15 @@ impl ConsensusCore {
             // From the execution handover height the set is execution's: no
             // operator path, and the host has already checked it names the set
             // its own execution derived. New members are what it is for.
-            let execution_owned = self
-                .execution_reconfig_from
-                .is_some_and(|from| b.height >= from);
+            // A retry of a transition certified before the handover keeps
+            // the rules it was certified under; refusing it would leave the
+            // locked epoch with no way to end.
+            let locked_retry =
+                self.epoch_ending_round.is_some() && self.pending_reconfig.as_ref() == Some(rc);
+            let execution_owned = !locked_retry
+                && self
+                    .execution_reconfig_from
+                    .is_some_and(|from| b.height >= from);
             if execution_owned {
                 if !crate::reconfig::is_execution_reconfig(rc) {
                     return out;
@@ -824,6 +830,19 @@ impl ConsensusCore {
             };
             ChainAnchorV2::from_block(parent)
         };
+        // From the execution handover an operator request staged earlier can
+        // no longer be voted. Drop it unless it is already certified.
+        if self.epoch_ending_round.is_none()
+            && self
+                .execution_reconfig_from
+                .is_some_and(|from| context.height >= from)
+            && self
+                .pending_reconfig
+                .as_ref()
+                .is_some_and(|rc| !crate::reconfig::is_execution_reconfig(rc))
+        {
+            self.pending_reconfig = None;
+        }
         let block = Block {
             header_version: BLOCK_HEADER_VERSION_V2,
             height: context.height,
@@ -4006,6 +4025,89 @@ mod tests {
             Some(Some(execution_reconfig(next.clone())))
         );
         assert_eq!(carried(None), Some(None));
+    }
+
+    /// From the handover an operator request staged earlier is not proposed;
+    /// before it, it still is.
+    #[test]
+    fn a_staged_operator_request_is_dropped_from_the_handover() {
+        let (kps, vset) = validators();
+        let leader1 = vset.leader(Round(1));
+        let me_idx = kps.iter().position(|k| k.node_id() == leader1).unwrap();
+        let operator = Keypair::from_seed(999_999);
+        let sig = operator.sign(
+            Domain::Reconfig,
+            &azbft_types::reconfig_signing_bytes(&vset, 0),
+        );
+        let carried = |from: u64| {
+            let mut core = core_as(&vset, me_idx);
+            core.set_execution_reconfig_from(from);
+            let _ = core.handle(Event::RequestReconfig(vset.clone(), sig.clone()), 0);
+            let _ = core.start();
+            let out = handle_payload_ready(&mut core, Round(1), b"p".to_vec(), 0);
+            let block = out.iter().find_map(|c| match c {
+                Command::Broadcast(ConsensusMessage::Proposal(sp)) => {
+                    Some(sp.inner.block.reconfig.clone())
+                }
+                _ => None,
+            });
+            (block, core.pending_reconfig.is_some())
+        };
+        assert_eq!(carried(1), (Some(None), false));
+        let (before, staged) = carried(2);
+        assert!(matches!(before, Some(Some(ref rc)) if rc.operator_sig.is_some()));
+        assert!(staged);
+    }
+
+    /// An operator transition certified before the handover is retried after
+    /// it under the rules it was certified under.
+    #[test]
+    fn a_transition_locked_before_the_handover_can_still_end() {
+        let (kps, vset) = validators();
+        let next = ValidatorSet::new(
+            kps.iter()
+                .take(3)
+                .map(|k| (k.node_id(), k.pubkey_bytes(), 1u64))
+                .collect(),
+        );
+        let operator = Keypair::from_seed(999_999);
+        let signed = Reconfig {
+            operator_sig: Some(operator.sign(
+                Domain::Reconfig,
+                &azbft_types::reconfig_signing_bytes(&next, 0),
+            )),
+            ..execution_reconfig(next)
+        };
+        let mut locked = execution_follower(&kps, &vset, Some(1));
+        locked.pending_reconfig = Some(signed.clone());
+        locked.epoch_ending_round = Some(Round(0));
+        let out = locked.handle(
+            Event::Proposal(make_reconfig_proposal(
+                &kps,
+                &vset,
+                signed.clone(),
+                b"retry",
+            )),
+            0,
+        );
+        assert!(voted(&out), "{out:?}");
+
+        // Its leader still proposes the retry.
+        let leader1 = vset.leader(Round(1));
+        let me_idx = kps.iter().position(|k| k.node_id() == leader1).unwrap();
+        let mut leader = core_as(&vset, me_idx);
+        leader.set_execution_reconfig_from(1);
+        leader.pending_reconfig = Some(signed.clone());
+        leader.epoch_ending_round = Some(Round(0));
+        let _ = leader.start();
+        let out = handle_payload_ready(&mut leader, Round(1), b"p".to_vec(), 0);
+        let carried = out.iter().find_map(|c| match c {
+            Command::Broadcast(ConsensusMessage::Proposal(sp)) => {
+                Some(sp.inner.block.reconfig.clone())
+            }
+            _ => None,
+        });
+        assert_eq!(carried, Some(Some(signed)));
     }
 
     /// A certified transition is locked: a later execution request cannot replace it.

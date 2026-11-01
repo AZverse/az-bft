@@ -475,6 +475,11 @@ impl ConsensusCore {
         self.execution_reconfig_from
     }
 
+    /// The certified transition this epoch is retrying until it commits, if any.
+    pub fn locked_reconfig(&self) -> Option<&Reconfig> {
+        self.epoch_ending_round.and(self.pending_reconfig.as_ref())
+    }
+
     /// set the leader-selection mode (a chain constant). Called at construction and
     /// re-applied on every epoch roll from the same config, so the mode never drifts.
     pub fn set_leader_mode(&mut self, mode: LeaderSchedule) {
