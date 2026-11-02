@@ -7,7 +7,8 @@
 use azbft_crypto::aggregator::verify_agg;
 use azbft_crypto::domain::Domain;
 use azbft_types::{
-    Block, ChainAnchorV2, Checkpoint, CommitCert, EpochChangeCert, QuorumCert, ValidatorSet,
+    Block, ChainAnchorV2, Checkpoint, CommitCert, EpochChangeCert, QuorumCert, Reconfig,
+    ValidatorSet,
 };
 
 /// Verifies that `block` is committed by a certified child in the next round.
@@ -113,6 +114,15 @@ pub fn verify_checkpoint(
         }
     }
     true
+}
+
+/// The only reconfiguration shape accepted once execution owns the validator
+/// set: a non-empty next set and nothing an operator or evidence would add.
+pub fn is_execution_reconfig(rc: &Reconfig) -> bool {
+    rc.operator_sig.is_none()
+        && rc.evidence.is_empty()
+        && rc.jail.is_none()
+        && !rc.next_set.is_empty()
 }
 
 /// Verifies a two-chain epoch-change certificate for `expected_epoch`.

@@ -161,3 +161,15 @@ its block receives a valid QC, the core permits only its direct child as the
 adjacent-round commit vehicle and does not vote further in the old epoch.
 Applying the resulting epoch-change certificate and starting the next epoch is
 a Host lifecycle action described in the recovery specification.
+
+A Host may hand reconfiguration authority to its execution from a block height
+`h`. A reconfiguration in a block at height `h` or above is then authorized only
+when it carries no operator signature, no evidence and no jail record, and
+names a non-empty set whose BLS keys all have valid proofs of possession; it may
+admit validators outside the current set. Which heights carry a reconfiguration
+and which set it names are execution's decision, checked by the Host before the
+proposal reaches the core. Below `h` the operator and evidence rules apply
+unchanged. A transition certified below `h` is retried under the rules it was
+certified under, at any height, until it commits; any other operator or
+evidence reconfiguration staged before `h` is dropped from blocks at `h` or
+above.
