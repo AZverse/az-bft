@@ -417,6 +417,7 @@ impl ConsensusCore {
         if target > self.round {
             self.round = target;
             self.stale_answered.clear();
+            self.stuck_in_round = false;
             if exit == RoundExit::Certified {
                 self.pacemaker.on_progress(target);
             }
@@ -898,8 +899,9 @@ impl ConsensusCore {
         }
         self.safety.mark_timeout(r);
         self.pacemaker.on_local_timeout(r);
-        // Still stuck: answer the stale timeouts of this pass again.
+        // Stuck: answer the stale timeouts of this pass (again).
         self.stale_answered.clear();
+        self.stuck_in_round = true;
         let t = Timeout {
             epoch: self.epoch,
             round: r,
@@ -957,8 +959,11 @@ impl ConsensusCore {
         // round it has left, so the timeout promises nothing new; the signature
         // binds only (epoch, round). Each (sender, round) is answered once per
         // round or local timeout of this node, so an answer reaching a validator
-        // that has also moved on is not answered back in a loop.
-        if t.round < self.round && t.sender != self.me {
+        // that has also moved on is not answered back in a loop. Only a node that
+        // has itself timed out its current round answers: while the chain makes
+        // progress a lagging validator catches up as before, and the answer
+        // changes nothing about how rounds advance.
+        if t.round < self.round && t.sender != self.me && self.stuck_in_round {
             if !self.stale_answered.insert((t.sender, t.round)) {
                 return out;
             }
@@ -1907,7 +1912,13 @@ mod tests {
             }
         }
         assert_eq!((cores[1].round(), cores[2].round()), (round, round));
-        // Validator 3 answers each of them directly.
+        // While validator 3 has not timed out round 21 it answers nothing.
+        assert!(!cores[3]
+            .handle(Event::RemoteTimeout(again[0].clone()), 0)
+            .iter()
+            .any(|command| matches!(command, Command::Send(..))));
+        // Stuck in round 21 too, it answers each of them directly.
+        let _ = cores[3].handle(Event::LocalTimeout(Round(21)), 0);
         for (index, timeout) in [(1usize, &again[0]), (2usize, &again[1])] {
             let commands = cores[3].handle(Event::RemoteTimeout(timeout.clone()), 0);
             let answer = commands
