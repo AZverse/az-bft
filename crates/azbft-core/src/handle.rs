@@ -80,6 +80,10 @@ pub(crate) enum RoundExit {
     TimedOut,
 }
 
+/// How many rounds behind its own a stuck node still answers a stale timeout
+/// (blockchain#181: the peers that lost their timeouts are one round behind).
+pub const STALE_ANSWER_WINDOW: u64 = 2;
+
 impl ConsensusCore {
     /// Bootstrap into the current round: if leader, request a payload; always arm the
     /// round timer.
@@ -416,6 +420,8 @@ impl ConsensusCore {
     pub(crate) fn advance_round(&mut self, target: Round, exit: RoundExit, out: &mut Vec<Command>) {
         if target > self.round {
             self.round = target;
+            self.stale_answered.clear();
+            self.stuck_in_round = false;
             if exit == RoundExit::Certified {
                 self.pacemaker.on_progress(target);
             }
@@ -432,7 +438,11 @@ impl ConsensusCore {
                 parent: self.high_qc.clone(),
             });
         }
-        out.push(Command::SetTimer(r, self.pacemaker.timer_duration(r)));
+        let leader = self.leader_after_parent(r, &self.high_qc);
+        out.push(Command::SetTimer(
+            r,
+            self.pacemaker.timer_duration_led_by(r, leader),
+        ));
     }
 
     /// Proposal path: verify author, store the block, absorb its parent QC
@@ -466,6 +476,11 @@ impl ConsensusCore {
         }
         if b.author != leader {
             return out;
+        }
+        // An authentic proposal from the round's leader: it is not absent.
+        self.pacemaker.on_leader_proposed(&leader);
+        if self.proposal_seen < b.round {
+            self.proposal_seen = b.round;
         }
 
         // Operator authorization: every reconfig block must be authorized — either by a valid
@@ -644,7 +659,8 @@ impl ConsensusCore {
             // Re-arm our own timer for this block's round.
             out.push(Command::SetTimer(
                 b.round,
-                self.pacemaker.timer_duration(b.round),
+                self.pacemaker
+                    .timer_duration_led_by(b.round, Some(b.author)),
             ));
             // Vote is signed over vote_digest(block_id, round) under Domain::Vote
             // — binding the round so a valid QC cannot be relabelled — matching
@@ -897,6 +913,17 @@ impl ConsensusCore {
         }
         self.safety.mark_timeout(r);
         self.pacemaker.on_local_timeout(r);
+        // Its leader's proposal never came: count the leader silent, once a round.
+        let leader = self.leader_after_parent(r, &self.high_qc);
+        if self.proposal_seen < r && self.silent_counted < r {
+            self.silent_counted = r;
+            if let Some(leader) = leader {
+                self.pacemaker.on_leader_silent(leader);
+            }
+        }
+        // Stuck: answer the stale timeouts of this pass (again).
+        self.stale_answered.clear();
+        self.stuck_in_round = true;
         let t = Timeout {
             epoch: self.epoch,
             round: r,
@@ -915,7 +942,10 @@ impl ConsensusCore {
         })));
         // Self re-arm with backed-off duration (pacemaker already counted this
         // timeout). Hosts only deliver timers; they never re-arm.
-        out.push(Command::SetTimer(r, self.pacemaker.timer_duration(r)));
+        out.push(Command::SetTimer(
+            r,
+            self.pacemaker.timer_duration_led_by(r, leader),
+        ));
         out
     }
 
@@ -931,9 +961,6 @@ impl ConsensusCore {
             return out;
         }
 
-        if self.tc_formed.contains_key(&t.round) {
-            return out;
-        }
         // Verify the timeout signature (Domain::Timeout over timeout_digest(epoch,
         // round)). t.epoch == self.epoch is enforced by the cross-epoch guard above.
         let Some(pk) = self.vset.pubkey_of(&t.sender).map(|p| p.to_vec()) else {
@@ -945,6 +972,50 @@ impl ConsensusCore {
             &st.sig,
             &pk,
         ) {
+            return out;
+        }
+
+        // A validator still timing out a round this node has left: after a cold
+        // restart it lost the timeouts it had collected, and this node, already
+        // past that round, will not time it out again, so neither side can finish
+        // a certificate. Answer with this node's timeout for that round and its
+        // high_qc: with the others' timeouts the peer forms the TC, and the QC
+        // moves it on if the round ended with one. This node cannot vote in a
+        // round it has left, so the timeout promises nothing new; the signature
+        // binds only (epoch, round). Each (sender, round) is answered once per
+        // round or local timeout of this node, so an answer reaching a validator
+        // that has also moved on is not answered back in a loop. Only a node that
+        // has itself timed out its current round answers: while the chain makes
+        // progress a lagging validator catches up as before, and the answer
+        // changes nothing about how rounds advance.
+        // Only rounds just behind this one are answered: the restart split above is one
+        // round behind, and an unbounded window would let a faulty validator make a stuck
+        // node sign (and remember) one answer for every past round.
+        if t.round < self.round
+            && self.round.0 - t.round.0 <= STALE_ANSWER_WINDOW
+            && t.sender != self.me
+            && self.stuck_in_round
+        {
+            if !self.stale_answered.insert((t.sender, t.round)) {
+                return out;
+            }
+            let reply = Timeout {
+                epoch: self.epoch,
+                round: t.round,
+                high_qc: self.high_qc.clone(),
+                sender: self.me,
+            };
+            let sig = self
+                .signer
+                .sign(Domain::Timeout, &timeout_digest(self.epoch, t.round).0);
+            out.push(Command::Send(
+                t.sender,
+                ConsensusMessage::Timeout(Signed { inner: reply, sig }),
+            ));
+            return out;
+        }
+
+        if self.tc_formed.contains_key(&t.round) {
             return out;
         }
 
@@ -1188,6 +1259,38 @@ mod tests {
             vec![100, 200, 400, 800, 1600, 3200, 6400, 6400],
             "base 100 holds for the first timed-out round, then doubles once per further \
              consecutive one, up to the cap"
+        );
+    }
+
+    /// blockchain#191: a leader whose rounds keep expiring without its proposal
+    /// is absent; once it has let three of its rounds expire, entering its round
+    /// arms a quarter of the timer the other leaders' rounds get at the same
+    /// backoff.
+    #[test]
+    fn an_absent_leaders_round_gets_a_shorter_timer() {
+        let (kps, vset) = validators();
+        let mut core = core_as(&vset, 0);
+        core.start();
+        let mut silent: std::collections::BTreeMap<NodeId, u32> = Default::default();
+        let mut checked = 0;
+        for round in 1..=16u64 {
+            *silent.entry(vset.leader(Round(round))).or_default() += 1;
+            // The re-armed timer fires again before the TC forms: the leader is
+            // still counted once for the round.
+            core.handle(Event::LocalTimeout(Round(round)), 0);
+            let out = time_out_round(&mut core, &kps, Round(round));
+            let next = Round(round + 1);
+            let armed = armed_timer(&out, next).expect("entering a round arms its timer");
+            if round >= 7 {
+                // The backoff has reached its cap (6400 at base 100).
+                let absent = silent.get(&vset.leader(next)).copied().unwrap_or(0) >= 3;
+                assert_eq!(armed, if absent { 1600 } else { 6400 }, "round {}", next.0);
+                checked += usize::from(absent);
+            }
+        }
+        assert!(
+            checked >= 4,
+            "absent leaders' rounds were armed short {checked} times"
         );
     }
 
@@ -1829,6 +1932,126 @@ mod tests {
             Round(2),
             "quorum of timeouts should advance to round 2"
         );
+    }
+
+    /// A restart split the other way round: one validator holds the TC of a round
+    /// it has left, two others lost the timeouts they had collected for it and keep
+    /// timing it out; the fourth is down. The two lagging validators' timeouts are
+    /// answered with the leader's timeout for their round, they form the TC and
+    /// join it.
+    /// A stuck node answers a stale timeout only within STALE_ANSWER_WINDOW rounds of its
+    /// own: a faulty validator cannot make it sign one answer for every past round.
+    #[test]
+    fn a_stale_timeout_far_behind_is_not_answered() {
+        let (_kps, vset) = validators();
+        let mut ahead = core_as(&vset, 3);
+        ahead.advance_round(Round(30), RoundExit::Certified, &mut Vec::new());
+        let _ = ahead.handle(Event::LocalTimeout(Round(30)), 0);
+        for (behind, answered) in [
+            (30 - STALE_ANSWER_WINDOW, true),
+            (30 - STALE_ANSWER_WINDOW - 1, false),
+            (1, false),
+        ] {
+            let mut peer = core_as(&vset, 1);
+            peer.advance_round(Round(behind), RoundExit::Certified, &mut Vec::new());
+            let timeout = peer
+                .handle(Event::LocalTimeout(Round(behind)), 0)
+                .into_iter()
+                .find_map(|command| match command {
+                    Command::Broadcast(ConsensusMessage::Timeout(timeout)) => Some(timeout),
+                    _ => None,
+                })
+                .expect("local timeout is broadcast");
+            let sent = ahead
+                .handle(Event::RemoteTimeout(timeout), 0)
+                .iter()
+                .any(|command| matches!(command, Command::Send(..)));
+            assert_eq!(sent, answered, "a timeout for round {behind}");
+        }
+    }
+
+    #[test]
+    fn validators_behind_a_round_another_left_catch_up_on_its_answer() {
+        let (_kps, vset) = validators();
+        let round = Round(20);
+        let mut cores: Vec<_> = (0..4).map(|index| core_as(&vset, index)).collect();
+        for core in &mut cores {
+            core.advance_round(round, RoundExit::Certified, &mut Vec::new());
+        }
+        let timeout_of = |core: &mut ConsensusCore| {
+            core.handle(Event::LocalTimeout(round), 0)
+                .into_iter()
+                .find_map(|command| match command {
+                    Command::Broadcast(ConsensusMessage::Timeout(timeout)) => Some(timeout),
+                    _ => None,
+                })
+                .expect("local timeout is broadcast")
+        };
+        let before: Vec<_> = (0..4).map(|index| timeout_of(&mut cores[index])).collect();
+        // Validator 3 collects 0, 1 and 2: it forms the TC and moves on. Then the
+        // others restart (they lose what they had collected) and validator 0 is down.
+        for timeout in &before[0..3] {
+            let _ = cores[3].handle(Event::RemoteTimeout(timeout.clone()), 0);
+        }
+        assert_eq!(cores[3].round(), Round(21));
+        for index in [1, 2] {
+            cores[index] = core_as(&vset, index);
+            cores[index].advance_round(round, RoundExit::Certified, &mut Vec::new());
+        }
+        let again = [timeout_of(&mut cores[1]), timeout_of(&mut cores[2])];
+        // 1 and 2 hear their own and each other's (the driver loops a broadcast back);
+        // that is two of the three a TC needs.
+        for index in [1, 2] {
+            for timeout in &again {
+                let _ = cores[index].handle(Event::RemoteTimeout(timeout.clone()), 0);
+            }
+        }
+        assert_eq!((cores[1].round(), cores[2].round()), (round, round));
+        // While validator 3 has not timed out round 21 it answers nothing.
+        assert!(!cores[3]
+            .handle(Event::RemoteTimeout(again[0].clone()), 0)
+            .iter()
+            .any(|command| matches!(command, Command::Send(..))));
+        // Stuck in round 21 too, it answers each of them directly.
+        let _ = cores[3].handle(Event::LocalTimeout(Round(21)), 0);
+        for (index, timeout) in [(1usize, &again[0]), (2usize, &again[1])] {
+            let commands = cores[3].handle(Event::RemoteTimeout(timeout.clone()), 0);
+            let answer = commands
+                .into_iter()
+                .find_map(|command| match command {
+                    Command::Send(to, ConsensusMessage::Timeout(answer)) => {
+                        assert_eq!(to, cores[index].me);
+                        Some(answer)
+                    }
+                    _ => None,
+                })
+                .expect("the stale timeout is answered");
+            assert_eq!(answer.inner.round, round);
+            let _ = cores[index].handle(Event::RemoteTimeout(answer), 0);
+            assert_eq!(
+                cores[index].round(),
+                Round(21),
+                "validator {index} caught up"
+            );
+        }
+        assert_eq!(
+            cores[3].round(),
+            Round(21),
+            "answering does not move the leader"
+        );
+        // A timeout for the current round is not answered.
+        let current = cores[1].handle(Event::LocalTimeout(Round(21)), 0);
+        let current = current
+            .into_iter()
+            .find_map(|command| match command {
+                Command::Broadcast(ConsensusMessage::Timeout(timeout)) => Some(timeout),
+                _ => None,
+            })
+            .unwrap();
+        assert!(!cores[3]
+            .handle(Event::RemoteTimeout(current), 0)
+            .iter()
+            .any(|command| matches!(command, Command::Send(..))));
     }
 
     #[test]

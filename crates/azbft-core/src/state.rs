@@ -103,6 +103,17 @@ pub struct ConsensusCore {
     pub(crate) timeouts: BTreeMap<Round, TimeoutSet>,
     /// Guard: a round whose TC has already formed.
     pub(crate) tc_formed: BTreeMap<Round, ()>,
+    /// Stale timeouts answered since this node last entered a round or timed out
+    /// locally: each (sender, round) once, so two validators past a round never
+    /// answer each other's answers in a loop.
+    pub(crate) stale_answered: std::collections::BTreeSet<(NodeId, Round)>,
+    /// This node has timed out its current round: it is stuck too, and only then
+    /// answers a timeout for a round it has left (see `on_remote_timeout`).
+    pub(crate) stuck_in_round: bool,
+    /// The highest round for which this node received its leader's proposal.
+    pub(crate) proposal_seen: Round,
+    /// The highest round whose expiry already counted its leader silent.
+    pub(crate) silent_counted: Round,
     /// A reconfiguration staged to ride out on the next block this node authors.
     /// Once a QC certifies it, the exact value stays here as the immutable
     /// transition lock and is re-emitted after view changes until an adjacent
@@ -274,6 +285,10 @@ impl ConsensusCore {
             qc_formed: BTreeMap::new(),
             timeouts: BTreeMap::new(),
             tc_formed: BTreeMap::new(),
+            stale_answered: std::collections::BTreeSet::new(),
+            stuck_in_round: false,
+            proposal_seen: Round(0),
+            silent_counted: Round(0),
             pending_reconfig: None,
             epoch_ending_round: None,
             voted: BTreeMap::new(),

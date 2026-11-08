@@ -1,4 +1,5 @@
-use azbft_types::Round;
+use azbft_types::{NodeId, Round};
+use std::collections::BTreeMap;
 
 /// The most times the round timer doubles before it stops growing, so the
 /// longest timer is `base << MAX_BACKOFF_DOUBLINGS` (64 x base).
@@ -28,9 +29,25 @@ pub const MAX_BACKOFF_DOUBLINGS: u32 = 6;
 /// that round is the one this keeps at base.
 pub const UNBACKED_TIMEOUTS: u32 = 1;
 
+/// How many of its rounds a leader must let expire without a proposal before
+/// this node shortens the timer of its rounds.
+///
+/// A validator that is down still leads its share of rounds; each of them
+/// waits out the whole timer. With six validators and one down the chain
+/// committed about 4 blocks/s against 27 (blockchain#191). The leader schedule
+/// and the voting rules stay as they are: only this node's wait for an absent
+/// leader shrinks, so safety is untouched, and the backoff still grows over it
+/// when rounds keep expiring for some other reason.
+pub const ABSENT_LEADER_ROUNDS: u32 = 3;
+
+/// The timer of an absent leader's round is the base divided by this (at least 1 ms).
+pub const ABSENT_LEADER_TIMER_DIVISOR: u64 = 4;
+
 pub struct Pacemaker {
     base: u64,
     consecutive_timeouts: u32,
+    /// Rounds each leader let expire without a proposal since its last one.
+    silent: BTreeMap<NodeId, u32>,
 }
 
 impl Pacemaker {
@@ -38,15 +55,45 @@ impl Pacemaker {
         Self {
             base,
             consecutive_timeouts: 0,
+            silent: BTreeMap::new(),
         }
     }
 
-    pub fn timer_duration(&self, _round: Round) -> u64 {
+    pub fn timer_duration(&self, round: Round) -> u64 {
+        self.timer_duration_led_by(round, None)
+    }
+
+    /// The timer of `round`, led by `leader` if known: the base, divided for
+    /// a leader absent for [`ABSENT_LEADER_ROUNDS`] of its rounds, then backed
+    /// off for consecutive timeouts.
+    pub fn timer_duration_led_by(&self, _round: Round, leader: Option<NodeId>) -> u64 {
         let doublings = self
             .consecutive_timeouts
             .saturating_sub(UNBACKED_TIMEOUTS)
             .min(MAX_BACKOFF_DOUBLINGS);
-        self.base.saturating_mul(1u64 << doublings)
+        let base = if leader.is_some_and(|leader| self.is_absent(&leader)) {
+            (self.base / ABSENT_LEADER_TIMER_DIVISOR).max(1)
+        } else {
+            self.base
+        };
+        base.saturating_mul(1u64 << doublings)
+    }
+
+    /// Whether `leader` let [`ABSENT_LEADER_ROUNDS`] of its rounds expire
+    /// without a proposal since its last one.
+    pub fn is_absent(&self, leader: &NodeId) -> bool {
+        self.silent.get(leader).copied().unwrap_or(0) >= ABSENT_LEADER_ROUNDS
+    }
+
+    /// A round led by `leader` expired without its proposal.
+    pub fn on_leader_silent(&mut self, leader: NodeId) {
+        let silent = self.silent.entry(leader).or_insert(0);
+        *silent = silent.saturating_add(1);
+    }
+
+    /// `leader` proposed: it is no longer absent.
+    pub fn on_leader_proposed(&mut self, leader: &NodeId) {
+        self.silent.remove(leader);
     }
 
     pub fn on_local_timeout(&mut self, _round: Round) {
@@ -62,6 +109,49 @@ impl Pacemaker {
 mod tests {
     use super::*;
     use azbft_types::Round;
+
+    /// A leader that lets three of its rounds expire is absent: its rounds
+    /// get a quarter of the timer, still backed off; a proposal from it ends
+    /// that. Other leaders keep the full timer.
+    #[test]
+    fn an_absent_leader_gets_a_shorter_timer_until_it_proposes() {
+        let absent = NodeId([7; 20]);
+        let other = NodeId([8; 20]);
+        let mut p = Pacemaker::new(100);
+        for _ in 0..ABSENT_LEADER_ROUNDS - 1 {
+            p.on_leader_silent(absent);
+        }
+        assert_eq!(
+            p.timer_duration_led_by(Round(1), Some(absent)),
+            100,
+            "not yet absent"
+        );
+        p.on_leader_silent(absent);
+        assert!(p.is_absent(&absent));
+        assert_eq!(p.timer_duration_led_by(Round(1), Some(absent)), 25);
+        assert_eq!(p.timer_duration_led_by(Round(1), Some(other)), 100);
+        assert_eq!(p.timer_duration_led_by(Round(1), None), 100);
+        p.on_local_timeout(Round(1));
+        p.on_local_timeout(Round(2));
+        assert_eq!(
+            p.timer_duration_led_by(Round(3), Some(absent)),
+            50,
+            "backoff still applies"
+        );
+        p.on_leader_proposed(&absent);
+        assert!(!p.is_absent(&absent));
+        assert_eq!(p.timer_duration_led_by(Round(3), Some(absent)), 200);
+        assert_eq!(Pacemaker::new(2).timer_duration_led_by(Round(1), None), 2);
+        let mut tiny = Pacemaker::new(2);
+        for _ in 0..ABSENT_LEADER_ROUNDS {
+            tiny.on_leader_silent(absent);
+        }
+        assert_eq!(
+            tiny.timer_duration_led_by(Round(1), Some(absent)),
+            1,
+            "never zero"
+        );
+    }
 
     #[test]
     fn backoff_doubles_on_consecutive_timeouts() {
