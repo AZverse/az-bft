@@ -80,6 +80,10 @@ pub(crate) enum RoundExit {
     TimedOut,
 }
 
+/// How many rounds behind its own a stuck node still answers a stale timeout
+/// (blockchain#181: the peers that lost their timeouts are one round behind).
+pub const STALE_ANSWER_WINDOW: u64 = 2;
+
 impl ConsensusCore {
     /// Bootstrap into the current round: if leader, request a payload; always arm the
     /// round timer.
@@ -984,7 +988,14 @@ impl ConsensusCore {
         // has itself timed out its current round answers: while the chain makes
         // progress a lagging validator catches up as before, and the answer
         // changes nothing about how rounds advance.
-        if t.round < self.round && t.sender != self.me && self.stuck_in_round {
+        // Only rounds just behind this one are answered: the restart split above is one
+        // round behind, and an unbounded window would let a faulty validator make a stuck
+        // node sign (and remember) one answer for every past round.
+        if t.round < self.round
+            && self.round.0 - t.round.0 <= STALE_ANSWER_WINDOW
+            && t.sender != self.me
+            && self.stuck_in_round
+        {
             if !self.stale_answered.insert((t.sender, t.round)) {
                 return out;
             }
@@ -1928,6 +1939,37 @@ mod tests {
     /// timing it out; the fourth is down. The two lagging validators' timeouts are
     /// answered with the leader's timeout for their round, they form the TC and
     /// join it.
+    /// A stuck node answers a stale timeout only within STALE_ANSWER_WINDOW rounds of its
+    /// own: a faulty validator cannot make it sign one answer for every past round.
+    #[test]
+    fn a_stale_timeout_far_behind_is_not_answered() {
+        let (_kps, vset) = validators();
+        let mut ahead = core_as(&vset, 3);
+        ahead.advance_round(Round(30), RoundExit::Certified, &mut Vec::new());
+        let _ = ahead.handle(Event::LocalTimeout(Round(30)), 0);
+        for (behind, answered) in [
+            (30 - STALE_ANSWER_WINDOW, true),
+            (30 - STALE_ANSWER_WINDOW - 1, false),
+            (1, false),
+        ] {
+            let mut peer = core_as(&vset, 1);
+            peer.advance_round(Round(behind), RoundExit::Certified, &mut Vec::new());
+            let timeout = peer
+                .handle(Event::LocalTimeout(Round(behind)), 0)
+                .into_iter()
+                .find_map(|command| match command {
+                    Command::Broadcast(ConsensusMessage::Timeout(timeout)) => Some(timeout),
+                    _ => None,
+                })
+                .expect("local timeout is broadcast");
+            let sent = ahead
+                .handle(Event::RemoteTimeout(timeout), 0)
+                .iter()
+                .any(|command| matches!(command, Command::Send(..)));
+            assert_eq!(sent, answered, "a timeout for round {behind}");
+        }
+    }
+
     #[test]
     fn validators_behind_a_round_another_left_catch_up_on_its_answer() {
         let (_kps, vset) = validators();
