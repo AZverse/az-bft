@@ -19,8 +19,8 @@ pub use apphash::{
     AppHashVote, AppHashVoteV1, APP_HASH_CERT_RESPONSE_LIMIT,
 };
 pub use block::{
-    validate_block_header_v2, Block, BlockHeaderV2Error, ChainAnchorV2, BLOCK_HEADER_VERSION_V2,
-    MAX_BLOCK_TIME_STEP_MS, MAX_FUTURE_DRIFT_MS,
+    minimum_live_timestamp_ms, validate_block_header_v2, Block, BlockHeaderV2Error, ChainAnchorV2,
+    BLOCK_HEADER_VERSION_V2, MAX_BLOCK_TIME_STEP_MS, MAX_FUTURE_DRIFT_MS, MAX_PAST_DRIFT_MS,
 };
 pub use cert::{AggSig, BlsAgg, QuorumCert, TimeoutCert};
 pub use checkpoint::Checkpoint;
