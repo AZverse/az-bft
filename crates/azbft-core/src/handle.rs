@@ -434,7 +434,11 @@ impl ConsensusCore {
                 parent: self.high_qc.clone(),
             });
         }
-        out.push(Command::SetTimer(r, self.pacemaker.timer_duration(r)));
+        let leader = self.leader_after_parent(r, &self.high_qc);
+        out.push(Command::SetTimer(
+            r,
+            self.pacemaker.timer_duration_led_by(r, leader),
+        ));
     }
 
     /// Proposal path: verify author, store the block, absorb its parent QC
@@ -468,6 +472,11 @@ impl ConsensusCore {
         }
         if b.author != leader {
             return out;
+        }
+        // An authentic proposal from the round's leader: it is not absent.
+        self.pacemaker.on_leader_proposed(&leader);
+        if self.proposal_seen < b.round {
+            self.proposal_seen = b.round;
         }
 
         // Operator authorization: every reconfig block must be authorized — either by a valid
@@ -646,7 +655,8 @@ impl ConsensusCore {
             // Re-arm our own timer for this block's round.
             out.push(Command::SetTimer(
                 b.round,
-                self.pacemaker.timer_duration(b.round),
+                self.pacemaker
+                    .timer_duration_led_by(b.round, Some(b.author)),
             ));
             // Vote is signed over vote_digest(block_id, round) under Domain::Vote
             // — binding the round so a valid QC cannot be relabelled — matching
@@ -899,6 +909,14 @@ impl ConsensusCore {
         }
         self.safety.mark_timeout(r);
         self.pacemaker.on_local_timeout(r);
+        // Its leader's proposal never came: count the leader silent, once a round.
+        let leader = self.leader_after_parent(r, &self.high_qc);
+        if self.proposal_seen < r && self.silent_counted < r {
+            self.silent_counted = r;
+            if let Some(leader) = leader {
+                self.pacemaker.on_leader_silent(leader);
+            }
+        }
         // Stuck: answer the stale timeouts of this pass (again).
         self.stale_answered.clear();
         self.stuck_in_round = true;
@@ -920,7 +938,10 @@ impl ConsensusCore {
         })));
         // Self re-arm with backed-off duration (pacemaker already counted this
         // timeout). Hosts only deliver timers; they never re-arm.
-        out.push(Command::SetTimer(r, self.pacemaker.timer_duration(r)));
+        out.push(Command::SetTimer(
+            r,
+            self.pacemaker.timer_duration_led_by(r, leader),
+        ));
         out
     }
 
@@ -1227,6 +1248,38 @@ mod tests {
             vec![100, 200, 400, 800, 1600, 3200, 6400, 6400],
             "base 100 holds for the first timed-out round, then doubles once per further \
              consecutive one, up to the cap"
+        );
+    }
+
+    /// blockchain#191: a leader whose rounds keep expiring without its proposal
+    /// is absent; once it has let three of its rounds expire, entering its round
+    /// arms a quarter of the timer the other leaders' rounds get at the same
+    /// backoff.
+    #[test]
+    fn an_absent_leaders_round_gets_a_shorter_timer() {
+        let (kps, vset) = validators();
+        let mut core = core_as(&vset, 0);
+        core.start();
+        let mut silent: std::collections::BTreeMap<NodeId, u32> = Default::default();
+        let mut checked = 0;
+        for round in 1..=16u64 {
+            *silent.entry(vset.leader(Round(round))).or_default() += 1;
+            // The re-armed timer fires again before the TC forms: the leader is
+            // still counted once for the round.
+            core.handle(Event::LocalTimeout(Round(round)), 0);
+            let out = time_out_round(&mut core, &kps, Round(round));
+            let next = Round(round + 1);
+            let armed = armed_timer(&out, next).expect("entering a round arms its timer");
+            if round >= 7 {
+                // The backoff has reached its cap (6400 at base 100).
+                let absent = silent.get(&vset.leader(next)).copied().unwrap_or(0) >= 3;
+                assert_eq!(armed, if absent { 1600 } else { 6400 }, "round {}", next.0);
+                checked += usize::from(absent);
+            }
+        }
+        assert!(
+            checked >= 4,
+            "absent leaders' rounds were armed short {checked} times"
         );
     }
 
