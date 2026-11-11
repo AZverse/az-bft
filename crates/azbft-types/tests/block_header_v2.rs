@@ -122,3 +122,73 @@ fn validation_rejects_wrong_version_height_and_time_step() {
         Err(BlockHeaderV2Error::TimestampStepTooLarge { .. })
     ));
 }
+
+#[test]
+fn live_validation_refuses_a_proposal_held_behind_the_clock() {
+    let parent = ChainAnchorV2 {
+        height: 40,
+        timestamp_ms: 1_000_000,
+    };
+    // The voter's clock reads 1_040_000: a proposal at parent + 1 ms is 39 s behind it.
+    assert_eq!(
+        validate_block_header_v2(&block(41, 1_000_001), parent, Some(1_040_000)),
+        Err(BlockHeaderV2Error::PastTimestamp {
+            timestamp_ms: 1_000_001,
+            minimum_timestamp_ms: 1_010_000,
+            local_wall_clock_ms: 1_040_000,
+        }),
+        "a leader may not hold block time back"
+    );
+    assert_eq!(
+        validate_block_header_v2(&block(41, 1_010_000), parent, Some(1_040_000)),
+        Ok(()),
+        "thirty seconds behind is still on time"
+    );
+    assert_eq!(
+        validate_block_header_v2(&block(41, 1_000_001), parent, None),
+        Ok(()),
+        "historical replay must not depend on the replaying host clock"
+    );
+}
+
+#[test]
+fn a_chain_catching_up_after_a_stall_is_on_time_at_one_full_step() {
+    // Stalled for an hour: an honest proposer can only advance sixty seconds a block.
+    let parent = ChainAnchorV2 {
+        height: 40,
+        timestamp_ms: 1_000_000,
+    };
+    let now = 1_000_000 + 3_600_000;
+    let proposal = parent.next_for_proposal(now).unwrap();
+    assert_eq!(proposal.timestamp_ms, 1_060_000);
+    assert_eq!(
+        validate_block_header_v2(&block(41, proposal.timestamp_ms), parent, Some(now)),
+        Ok(()),
+        "the full step is always accepted, or a stalled chain could never resume"
+    );
+    assert!(matches!(
+        validate_block_header_v2(&block(41, 1_059_999), parent, Some(now)),
+        Err(BlockHeaderV2Error::PastTimestamp { .. })
+    ));
+}
+
+#[test]
+fn an_honest_proposal_always_passes_the_honest_voters_bounds() {
+    for parent_ts in [1_000_000u64, 2_000_000] {
+        for lag in [
+            0u64, 1, 500, 29_999, 30_000, 59_999, 60_000, 60_001, 3_600_000,
+        ] {
+            let parent = ChainAnchorV2 {
+                height: 7,
+                timestamp_ms: parent_ts,
+            };
+            let now = parent_ts + lag;
+            let next = parent.next_for_proposal(now).unwrap();
+            assert_eq!(
+                validate_block_header_v2(&block(8, next.timestamp_ms), parent, Some(now)),
+                Ok(()),
+                "parent {parent_ts}, clock lag {lag}"
+            );
+        }
+    }
+}
