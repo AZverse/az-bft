@@ -175,8 +175,13 @@ fn a_chain_catching_up_after_a_stall_is_on_time_at_one_full_step() {
 #[test]
 fn an_honest_proposal_always_passes_the_honest_voters_bounds() {
     for parent_ts in [1_000_000u64, 2_000_000] {
-        for lag in [0u64, 1, 500, 29_999, 30_000, 59_999, 60_000, 60_001, 3_600_000] {
-            let parent = ChainAnchorV2 { height: 7, timestamp_ms: parent_ts };
+        for lag in [
+            0u64, 1, 500, 29_999, 30_000, 59_999, 60_000, 60_001, 3_600_000,
+        ] {
+            let parent = ChainAnchorV2 {
+                height: 7,
+                timestamp_ms: parent_ts,
+            };
             let now = parent_ts + lag;
             let next = parent.next_for_proposal(now).unwrap();
             assert_eq!(
