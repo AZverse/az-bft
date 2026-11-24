@@ -79,20 +79,25 @@ impl ConsensusCore {
             // The author is checked against the parent the block actually extends:
             // the anchor (already in the tree) for the first block, the previous
             // batch block after that. That parent's own parent QC is the liveness QC.
-            let liveness = if index == 0 {
+            let (liveness, parent_author) = if index == 0 {
                 if block.parent_qc.round.0 == 0 {
-                    None
+                    (None, None)
                 } else {
                     self.tree
                         .get(&block.parent_qc.block_id)
-                        .map(|anchor| anchor.parent_qc.clone())
+                        .map(|anchor| (Some(anchor.parent_qc.clone()), Some(anchor.author)))
+                        .unwrap_or((None, None))
                 }
             } else {
-                Some(blocks[index - 1].parent_qc.clone())
+                let parent = &blocks[index - 1];
+                (Some(parent.parent_qc.clone()), Some(parent.author))
             };
-            let expected = self
-                .vset
-                .leader_after(block.round, self.leader_mode, liveness.as_ref());
+            let expected = self.vset.leader_after(
+                block.round,
+                self.leader_mode,
+                liveness.as_ref(),
+                parent_author,
+            );
             if block.author != expected {
                 return Err("invalid ancestry author");
             }

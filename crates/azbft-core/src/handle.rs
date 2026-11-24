@@ -675,9 +675,12 @@ impl ConsensusCore {
             };
             // The next leader extends `b`, so its liveness QC is `b.parent_qc`, which
             // is known now — before any QC on `b` exists.
-            let next =
-                self.vset
-                    .leader_after(Round(b.round.0 + 1), self.leader_mode, Some(&b.parent_qc));
+            let next = self.vset.leader_after(
+                Round(b.round.0 + 1),
+                self.leader_mode,
+                Some(&b.parent_qc),
+                Some(b.author),
+            );
             let vote = ConsensusMessage::Vote(Signed { inner: vote, sig });
             // Also give the vote to the block's own leader (monad-bft routes votes
             // to the current and the next leader). Any collector that reaches quorum

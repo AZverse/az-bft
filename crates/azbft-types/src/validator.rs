@@ -198,6 +198,11 @@ impl ValidatorSet {
     /// - stake weighted: the base leader leads if it is in `E`, else the same
     ///   `blake3(round)` point is mapped over the cumulative stakes of `E`.
     ///
+    /// Under the `*Parent` schedules (blockchain#174) `parent_author`, the author of
+    /// the block the proposal extends, joins `E` when `E` is not empty: that author
+    /// has just proposed, but its own vote usually arrives after the quorum and is
+    /// missing from the QC. The other schedules ignore it.
+    ///
     /// Deterministic: the inputs are the round, this set and a QC fixed by the
     /// proposed block's ancestry, so every node verifying the same proposal
     /// computes the same leader.
@@ -206,14 +211,19 @@ impl ValidatorSet {
         round: Round,
         mode: LeaderSchedule,
         liveness: Option<&QuorumCert>,
+        parent_author: Option<NodeId>,
     ) -> NodeId {
         let base = self.leader_with_mode(round, mode);
         let Some(qc) = liveness.filter(|q| mode.skips_absent() && q.round.0 != 0) else {
             return base;
         };
         let signers = qc.agg.signers();
-        let eligible = |id: &NodeId| signers.contains(id);
-        if !self.members.iter().any(|m| eligible(&m.node_id)) || eligible(&base) {
+        if !self.members.iter().any(|m| signers.contains(&m.node_id)) {
+            return base;
+        }
+        let parent_author = parent_author.filter(|_| mode.counts_parent_author());
+        let eligible = |id: &NodeId| signers.contains(id) || parent_author.as_ref() == Some(id);
+        if eligible(&base) {
             return base;
         }
         match mode.base() {
@@ -563,7 +573,7 @@ mod tests {
             let qc = liveness(7, &present);
             for r in 1..40u64 {
                 let base = v.leader(Round(r));
-                let got = v.leader_after(Round(r), mode, Some(&qc));
+                let got = v.leader_after(Round(r), mode, Some(&qc), None);
                 if base == NodeId([absent; 20]) {
                     // the next member in schedule order takes the turn
                     assert_eq!(got, v.leader(Round(r + 1)), "round {r}, absent {absent}");
@@ -580,10 +590,22 @@ mod tests {
         // members 2 and 3 absent: round 2 and round 3 both go to member 4
         let qc = liveness(9, &[0, 1, 4, 5, 6]);
         let mode = LeaderSchedule::RoundRobinSkipAbsent;
-        assert_eq!(v.leader_after(Round(2), mode, Some(&qc)), NodeId([4; 20]));
-        assert_eq!(v.leader_after(Round(3), mode, Some(&qc)), NodeId([4; 20]));
-        assert_eq!(v.leader_after(Round(4), mode, Some(&qc)), NodeId([4; 20]));
-        assert_eq!(v.leader_after(Round(1), mode, Some(&qc)), NodeId([1; 20]));
+        assert_eq!(
+            v.leader_after(Round(2), mode, Some(&qc), None),
+            NodeId([4; 20])
+        );
+        assert_eq!(
+            v.leader_after(Round(3), mode, Some(&qc), None),
+            NodeId([4; 20])
+        );
+        assert_eq!(
+            v.leader_after(Round(4), mode, Some(&qc), None),
+            NodeId([4; 20])
+        );
+        assert_eq!(
+            v.leader_after(Round(1), mode, Some(&qc), None),
+            NodeId([1; 20])
+        );
     }
 
     #[test]
@@ -606,14 +628,18 @@ mod tests {
             for r in 0..30u64 {
                 let want = v.leader_with_mode(Round(r), base);
                 assert_eq!(v.leader_with_mode(Round(r), mode), want);
-                assert_eq!(v.leader_after(Round(r), mode, None), want, "no liveness QC");
                 assert_eq!(
-                    v.leader_after(Round(r), mode, Some(&QuorumCert::genesis())),
+                    v.leader_after(Round(r), mode, None, None),
+                    want,
+                    "no liveness QC"
+                );
+                assert_eq!(
+                    v.leader_after(Round(r), mode, Some(&QuorumCert::genesis()), None),
                     want,
                     "the genesis QC names no signers"
                 );
                 assert_eq!(
-                    v.leader_after(Round(r), mode, Some(&unknown_signers)),
+                    v.leader_after(Round(r), mode, Some(&unknown_signers), None),
                     want,
                     "signers from another set leave E empty"
                 );
@@ -627,11 +653,11 @@ mod tests {
         let qc = liveness(3, &[0]);
         for r in 0..30u64 {
             assert_eq!(
-                v.leader_after(Round(r), LeaderSchedule::RoundRobin, Some(&qc)),
+                v.leader_after(Round(r), LeaderSchedule::RoundRobin, Some(&qc), None),
                 v.leader(Round(r))
             );
             assert_eq!(
-                v.leader_after(Round(r), LeaderSchedule::StakeWeighted, Some(&qc)),
+                v.leader_after(Round(r), LeaderSchedule::StakeWeighted, Some(&qc), None),
                 v.leader_weighted(Round(r))
             );
         }
@@ -646,7 +672,7 @@ mod tests {
         let mut counts = [0u32; 4];
         for r in 0..600u64 {
             let base = v.leader_weighted(Round(r));
-            let got = v.leader_after(Round(r), mode, Some(&qc));
+            let got = v.leader_after(Round(r), mode, Some(&qc), None);
             assert_ne!(got, NodeId([0; 20]), "round {r} went to the absent member");
             if base != NodeId([0; 20]) {
                 assert_eq!(got, base, "a present base leader keeps round {r}");
@@ -658,5 +684,182 @@ mod tests {
         assert!(moved > 0, "the absent member led some base rounds");
         // remapped rounds follow the present stakes 1:3:2, so member 2 leads most
         assert!(counts[2] > counts[3] && counts[3] > counts[1], "{counts:?}");
+    }
+
+    /// blockchain#174: the parent block's author leads its base rounds although the liveness QC
+    /// leaves its vote out.
+    #[test]
+    fn parent_present_lets_the_parent_author_keep_its_base_rounds() {
+        let v = vs(4);
+        let qc = liveness(7, &[0, 1, 2]); // the parent's author, member 3, is not in its QC
+        let author = Some(NodeId([3; 20]));
+        for r in 1..40u64 {
+            let base = v.leader(Round(r));
+            assert_eq!(
+                v.leader_after(
+                    Round(r),
+                    LeaderSchedule::RoundRobinSkipAbsentParent,
+                    Some(&qc),
+                    author
+                ),
+                base,
+                "round {r}: every base leader is present"
+            );
+            if base == NodeId([3; 20]) {
+                assert_eq!(
+                    v.leader_after(
+                        Round(r),
+                        LeaderSchedule::RoundRobinSkipAbsent,
+                        Some(&qc),
+                        author
+                    ),
+                    v.leader(Round(r + 1)),
+                    "round {r}: the old schedule still hands it away"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn parent_present_still_skips_a_member_that_is_truly_absent() {
+        let v = vs(4);
+        let qc = liveness(7, &[0, 1, 2]); // member 3 is absent and did not author the parent
+        let mode = LeaderSchedule::RoundRobinSkipAbsentParent;
+        for r in 1..40u64 {
+            let base = v.leader(Round(r));
+            let got = v.leader_after(Round(r), mode, Some(&qc), Some(NodeId([1; 20])));
+            if base == NodeId([3; 20]) {
+                assert_eq!(got, v.leader(Round(r + 1)), "round {r}");
+            } else {
+                assert_eq!(got, base, "round {r}");
+            }
+        }
+    }
+
+    #[test]
+    fn parent_present_adds_nothing_when_no_member_signed_the_liveness_qc() {
+        let v = vs(4);
+        let mode = LeaderSchedule::RoundRobinSkipAbsentParent;
+        let other_set = QuorumCert {
+            agg: crate::cert::AggSig::Secp(vec![(NodeId([99; 20]), vec![])]),
+            ..liveness(5, &[])
+        };
+        let author = Some(NodeId([2; 20]));
+        for r in 0..30u64 {
+            let base = v.leader(Round(r));
+            assert_eq!(
+                v.leader_after(Round(r), mode, None, author),
+                base,
+                "no liveness QC"
+            );
+            assert_eq!(
+                v.leader_after(Round(r), mode, Some(&QuorumCert::genesis()), author),
+                base,
+                "the genesis QC"
+            );
+            assert_eq!(
+                v.leader_after(Round(r), mode, Some(&other_set), author),
+                base,
+                "an epoch start: the parent's author alone does not make E"
+            );
+        }
+    }
+
+    #[test]
+    fn parent_present_ignores_an_author_from_outside_the_set() {
+        let v = vs(4);
+        let qc = liveness(7, &[0, 1, 2]);
+        for r in 1..40u64 {
+            assert_eq!(
+                v.leader_after(
+                    Round(r),
+                    LeaderSchedule::RoundRobinSkipAbsentParent,
+                    Some(&qc),
+                    Some(NodeId([99; 20]))
+                ),
+                v.leader_after(
+                    Round(r),
+                    LeaderSchedule::RoundRobinSkipAbsent,
+                    Some(&qc),
+                    None
+                ),
+                "round {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn earlier_schedules_ignore_the_parent_author() {
+        let v = vs_staked(&[5, 1, 3, 2]);
+        let qc = liveness(11, &[1, 2, 3]);
+        let author = Some(NodeId([0; 20]));
+        for mode in [
+            LeaderSchedule::RoundRobin,
+            LeaderSchedule::StakeWeighted,
+            LeaderSchedule::RoundRobinSkipAbsent,
+            LeaderSchedule::StakeWeightedSkipAbsent,
+        ] {
+            for r in 0..200u64 {
+                assert_eq!(
+                    v.leader_after(Round(r), mode, Some(&qc), author),
+                    v.leader_after(Round(r), mode, Some(&qc), None),
+                    "{mode:?} round {r}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stake_weighted_parent_present_keeps_the_parent_authors_rounds() {
+        let v = vs_staked(&[5, 1, 3, 2]);
+        let qc = liveness(11, &[1, 2, 3]); // the heaviest member 0 authored the parent
+        let mode = LeaderSchedule::StakeWeightedSkipAbsentParent;
+        let mut moved = 0;
+        for r in 0..600u64 {
+            let base = v.leader_weighted(Round(r));
+            assert_eq!(
+                v.leader_after(Round(r), mode, Some(&qc), Some(NodeId([0; 20]))),
+                base,
+                "round {r}"
+            );
+            let other = v.leader_after(Round(r), mode, Some(&qc), Some(NodeId([1; 20])));
+            if base == NodeId([0; 20]) {
+                assert_ne!(other, base, "round {r}: absent and not the author");
+                moved += 1;
+            }
+        }
+        assert!(moved > 0, "member 0 led some base rounds");
+    }
+
+    #[test]
+    fn stake_weighted_parent_present_remaps_over_the_signers_and_the_parent_author() {
+        // Member 3 is truly absent; member 0 authored the parent but is missing from its QC.
+        let v = vs_staked(&[5, 1, 3, 2]);
+        let qc = liveness(11, &[1, 2]);
+        let mode = LeaderSchedule::StakeWeightedSkipAbsentParent;
+        let author = Some(NodeId([0; 20]));
+        let (mut to_author, mut to_signers) = (0, 0);
+        for r in 0..600u64 {
+            let base = v.leader_weighted(Round(r));
+            let got = v.leader_after(Round(r), mode, Some(&qc), author);
+            assert_ne!(got, NodeId([3; 20]), "round {r} went to the absent member");
+            if base == NodeId([0; 20]) {
+                assert_eq!(
+                    got, base,
+                    "round {r}: the parent's author keeps its own round"
+                );
+            } else if base == NodeId([3; 20]) {
+                if got == NodeId([0; 20]) {
+                    to_author += 1;
+                } else {
+                    to_signers += 1;
+                }
+            }
+        }
+        // The absent member's rounds follow the stakes of E = {0, 1, 2}: 5:1:3.
+        assert!(
+            to_author > to_signers && to_signers > 0,
+            "{to_author} vs {to_signers}"
+        );
     }
 }
