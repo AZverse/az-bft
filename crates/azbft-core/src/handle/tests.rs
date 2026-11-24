@@ -4073,3 +4073,172 @@ fn ancestry_import_checks_skip_absent_authors() {
     assert_eq!(import(absent), Err("invalid ancestry author"));
     assert_eq!(import(skip), Ok(()));
 }
+
+/// blockchain#174, as a live chain reaches it: b2's parent QC lacks `absent`, the base
+/// leader of round 3, so round 3 legitimately goes to the next member, `late` (the base
+/// leader of round 4). b3's own parent QC then lacks `late`'s vote, which reached the
+/// quorum last. Returns `(b1, b2, b3, late, skip)`, `skip` being round 5's base leader.
+fn chain_with_a_late_author(
+    kps: &[Keypair],
+    vset: &ValidatorSet,
+) -> (Block, Block, Block, NodeId, NodeId) {
+    let absent = vset.leader(Round(3));
+    let late = vset.leader(Round(4));
+    let (b1, b2) = chain_without(kps, vset, absent);
+    let b3 = round3_block(kps, &b2, late, late);
+    (b1, b2, b3, late, vset.leader(Round(5)))
+}
+
+fn round4_block(kps: &[Keypair], b3: &Block, author: NodeId) -> Block {
+    let signers: Vec<&Keypair> = kps.iter().collect();
+    Block {
+        height: 4,
+        timestamp_ms: 4,
+        round: Round(4),
+        parent_qc: qc_by(b3.id(), Round(3), &signers),
+        payload_hash: blake3_id(&b"b4".to_vec()),
+        author,
+        ..b3.clone()
+    }
+}
+
+/// Under a `*Parent` schedule the parent's author keeps its own base round although its
+/// vote is missing from the liveness QC; under the earlier schedule it loses the round to
+/// the next member (control).
+#[test]
+fn parent_present_proposal_from_the_parent_author_is_voted() {
+    let (kps, vset) = validators();
+    let (b1, b2, b3, late, skip) = chain_with_a_late_author(&kps, &vset);
+    let me_idx = kps
+        .iter()
+        .position(|k| k.node_id() != late && k.node_id() != skip)
+        .unwrap();
+    let propose = |mode: LeaderSchedule, author: NodeId| {
+        let mut core = core_as(&vset, me_idx);
+        core.set_leader_mode(mode);
+        core.tree_insert_for_test(b1.clone());
+        core.tree_insert_for_test(b2.clone());
+        core.tree_insert_for_test(b3.clone());
+        core.handle(
+            Event::Proposal(sign_proposal(
+                kp_of(&kps, author),
+                &Proposal {
+                    block: round4_block(&kps, &b3, author),
+                    last_round_tc: None,
+                },
+            )),
+            0,
+        )
+    };
+    assert!(has_vote(&propose(
+        LeaderSchedule::RoundRobinSkipAbsentParent,
+        late
+    )));
+    assert!(!has_vote(&propose(
+        LeaderSchedule::RoundRobinSkipAbsentParent,
+        skip
+    )));
+    assert!(!has_vote(&propose(
+        LeaderSchedule::RoundRobinSkipAbsent,
+        late
+    )));
+    assert!(has_vote(&propose(
+        LeaderSchedule::RoundRobinSkipAbsent,
+        skip
+    )));
+}
+
+/// A replica voting on b3 routes its vote to round 4's leader, computed from b3's parent
+/// QC and b3's author: the late author itself under a `*Parent` schedule, the next member
+/// under the earlier one.
+#[test]
+fn parent_present_routes_the_vote_to_the_parent_author() {
+    let (kps, vset) = validators();
+    let (b1, b2, b3, late, skip) = chain_with_a_late_author(&kps, &vset);
+    let voter_idx = kps
+        .iter()
+        .position(|k| k.node_id() != late && k.node_id() != skip)
+        .unwrap();
+    let targets = |mode: LeaderSchedule| {
+        let mut voter = core_as(&vset, voter_idx);
+        voter.set_leader_mode(mode);
+        voter.tree_insert_for_test(b1.clone());
+        voter.tree_insert_for_test(b2.clone());
+        let out = voter.handle(
+            Event::Proposal(sign_proposal(
+                kp_of(&kps, late),
+                &Proposal {
+                    block: b3.clone(),
+                    last_round_tc: None,
+                },
+            )),
+            0,
+        );
+        vote_targets(&out)
+    };
+    let parent_present = targets(LeaderSchedule::RoundRobinSkipAbsentParent);
+    assert!(
+        parent_present.contains(&late) && !parent_present.contains(&skip),
+        "{parent_present:?}"
+    );
+    let earlier = targets(LeaderSchedule::RoundRobinSkipAbsent);
+    assert!(earlier.contains(&skip), "{earlier:?}");
+}
+
+/// Ancestry import checks each author against its parent's author too: under a `*Parent`
+/// schedule b4 by the late author is the valid ancestry and by the next member it is not;
+/// the earlier schedule decides the other way round.
+#[test]
+fn parent_present_ancestry_import_accepts_the_parent_author() {
+    let (kps, vset) = validators();
+    let (b1, b2, b3, late, skip) = chain_with_a_late_author(&kps, &vset);
+    let signers: Vec<&Keypair> = kps.iter().collect();
+    let import = |mode: LeaderSchedule, author: NodeId| {
+        let mut core = core_as(&vset, 0);
+        core.set_leader_mode(mode);
+        let b4 = round4_block(&kps, &b3, author);
+        let target = qc_by(b4.id(), Round(4), &signers);
+        core.import_live_ancestors(&[b1.clone(), b2.clone(), b3.clone(), b4], &target)
+    };
+    assert_eq!(
+        import(LeaderSchedule::RoundRobinSkipAbsentParent, late),
+        Ok(())
+    );
+    assert_eq!(
+        import(LeaderSchedule::RoundRobinSkipAbsentParent, skip),
+        Err("invalid ancestry author")
+    );
+    assert_eq!(
+        import(LeaderSchedule::RoundRobinSkipAbsent, late),
+        Err("invalid ancestry author")
+    );
+    assert_eq!(import(LeaderSchedule::RoundRobinSkipAbsent, skip), Ok(()));
+}
+
+/// The first imported block's parent is the anchor already in the tree: its author counts
+/// as present too.
+#[test]
+fn parent_present_ancestry_import_counts_the_anchor_author() {
+    let (kps, vset) = validators();
+    let (b1, b2, b3, late, skip) = chain_with_a_late_author(&kps, &vset);
+    let signers: Vec<&Keypair> = kps.iter().collect();
+    let import = |mode: LeaderSchedule, author: NodeId| {
+        let mut core = core_as(&vset, 0);
+        core.set_leader_mode(mode);
+        core.tree_insert_for_test(b1.clone());
+        core.tree_insert_for_test(b2.clone());
+        core.tree_insert_for_test(b3.clone());
+        let b4 = round4_block(&kps, &b3, author);
+        let target = qc_by(b4.id(), Round(4), &signers);
+        core.import_live_ancestors(&[b4], &target)
+    };
+    assert_eq!(
+        import(LeaderSchedule::RoundRobinSkipAbsentParent, late),
+        Ok(())
+    );
+    assert_eq!(
+        import(LeaderSchedule::RoundRobinSkipAbsentParent, skip),
+        Err("invalid ancestry author")
+    );
+    assert_eq!(import(LeaderSchedule::RoundRobinSkipAbsent, skip), Ok(()));
+}
