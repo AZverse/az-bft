@@ -15,6 +15,11 @@
 //! base schedule but hand a round away from a validator that did not sign the
 //! liveness QC — the QC carried by the parent of the block being proposed. See
 //! `ValidatorSet::leader_after`.
+//!
+//! `RoundRobinSkipAbsentParent` and `StakeWeightedSkipAbsentParent` (blockchain#174) also
+//! count the parent block's author as present. That author's own vote usually arrives after
+//! the quorum, so the liveness QC leaves it out; counted absent, it lost every round it was
+//! the base leader of, and one hand-over kept the whole schedule one place off.
 
 use borsh::{BorshDeserialize, BorshSerialize};
 
@@ -39,6 +44,10 @@ pub enum LeaderSchedule {
     /// `StakeWeighted`, re-mapping the same point over the stakes of the members
     /// present in the liveness QC when the base leader is absent from it.
     StakeWeightedSkipAbsent,
+    /// `RoundRobinSkipAbsent`, with the parent block's author present too (blockchain#174).
+    RoundRobinSkipAbsentParent,
+    /// `StakeWeightedSkipAbsent`, with the parent block's author present too (blockchain#174).
+    StakeWeightedSkipAbsentParent,
 }
 
 impl LeaderSchedule {
@@ -50,6 +59,8 @@ impl LeaderSchedule {
             LeaderSchedule::StakeWeighted => 1,
             LeaderSchedule::RoundRobinSkipAbsent => 2,
             LeaderSchedule::StakeWeightedSkipAbsent => 3,
+            LeaderSchedule::RoundRobinSkipAbsentParent => 4,
+            LeaderSchedule::StakeWeightedSkipAbsentParent => 5,
         }
     }
 
@@ -57,19 +68,43 @@ impl LeaderSchedule {
     pub fn skips_absent(self) -> bool {
         matches!(
             self,
-            LeaderSchedule::RoundRobinSkipAbsent | LeaderSchedule::StakeWeightedSkipAbsent
+            LeaderSchedule::RoundRobinSkipAbsent
+                | LeaderSchedule::StakeWeightedSkipAbsent
+                | LeaderSchedule::RoundRobinSkipAbsentParent
+                | LeaderSchedule::StakeWeightedSkipAbsentParent
         )
+    }
+
+    /// True for the schedules that count the parent block's author as present (blockchain#174).
+    pub fn counts_parent_author(self) -> bool {
+        matches!(
+            self,
+            LeaderSchedule::RoundRobinSkipAbsentParent
+                | LeaderSchedule::StakeWeightedSkipAbsentParent
+        )
+    }
+
+    /// The schedule a host switches a skip-absent chain to once the parent author counts as
+    /// present; every other schedule is returned as it is.
+    pub fn with_parent_present(self) -> LeaderSchedule {
+        match self {
+            LeaderSchedule::RoundRobinSkipAbsent => LeaderSchedule::RoundRobinSkipAbsentParent,
+            LeaderSchedule::StakeWeightedSkipAbsent => {
+                LeaderSchedule::StakeWeightedSkipAbsentParent
+            }
+            other => other,
+        }
     }
 
     /// The schedule a skip-absent mode falls back to (and itself for the others).
     pub fn base(self) -> LeaderSchedule {
         match self {
-            LeaderSchedule::RoundRobin | LeaderSchedule::RoundRobinSkipAbsent => {
-                LeaderSchedule::RoundRobin
-            }
-            LeaderSchedule::StakeWeighted | LeaderSchedule::StakeWeightedSkipAbsent => {
-                LeaderSchedule::StakeWeighted
-            }
+            LeaderSchedule::RoundRobin
+            | LeaderSchedule::RoundRobinSkipAbsent
+            | LeaderSchedule::RoundRobinSkipAbsentParent => LeaderSchedule::RoundRobin,
+            LeaderSchedule::StakeWeighted
+            | LeaderSchedule::StakeWeightedSkipAbsent
+            | LeaderSchedule::StakeWeightedSkipAbsentParent => LeaderSchedule::StakeWeighted,
         }
     }
 }
@@ -83,9 +118,14 @@ impl std::str::FromStr for LeaderSchedule {
             "stake_weighted" => Ok(LeaderSchedule::StakeWeighted),
             "round_robin_skip_absent" => Ok(LeaderSchedule::RoundRobinSkipAbsent),
             "stake_weighted_skip_absent" => Ok(LeaderSchedule::StakeWeightedSkipAbsent),
+            "round_robin_skip_absent_parent" => Ok(LeaderSchedule::RoundRobinSkipAbsentParent),
+            "stake_weighted_skip_absent_parent" => {
+                Ok(LeaderSchedule::StakeWeightedSkipAbsentParent)
+            }
             other => Err(format!(
                 "unknown leader_schedule '{other}' (expected: round_robin | stake_weighted | \
-                 round_robin_skip_absent | stake_weighted_skip_absent)"
+                 round_robin_skip_absent | stake_weighted_skip_absent | \
+                 round_robin_skip_absent_parent | stake_weighted_skip_absent_parent)"
             )),
         }
     }
@@ -140,6 +180,71 @@ mod tests {
             LeaderSchedule::StakeWeighted
         );
         assert!(LeaderSchedule::RoundRobinSkipAbsent.skips_absent());
+    }
+
+    #[test]
+    fn parent_present_modes_parse_and_keep_their_ordinals() {
+        // blockchain#174: genesis values 4 and 5. Only a chain that names them carries them in
+        // its genesis preimage, so the hashes of existing chains are unchanged.
+        assert_eq!(
+            LeaderSchedule::from_str("round_robin_skip_absent_parent").unwrap(),
+            LeaderSchedule::RoundRobinSkipAbsentParent
+        );
+        assert_eq!(
+            LeaderSchedule::from_str("stake_weighted_skip_absent_parent").unwrap(),
+            LeaderSchedule::StakeWeightedSkipAbsentParent
+        );
+        assert_eq!(LeaderSchedule::RoundRobinSkipAbsentParent.to_u8(), 4);
+        assert_eq!(LeaderSchedule::StakeWeightedSkipAbsentParent.to_u8(), 5);
+    }
+
+    #[test]
+    fn parent_present_modes_skip_absent_over_their_base() {
+        assert!(LeaderSchedule::RoundRobinSkipAbsentParent.skips_absent());
+        assert!(LeaderSchedule::StakeWeightedSkipAbsentParent.skips_absent());
+        assert_eq!(
+            LeaderSchedule::RoundRobinSkipAbsentParent.base(),
+            LeaderSchedule::RoundRobin
+        );
+        assert_eq!(
+            LeaderSchedule::StakeWeightedSkipAbsentParent.base(),
+            LeaderSchedule::StakeWeighted
+        );
+    }
+
+    #[test]
+    fn only_parent_present_modes_count_the_parent_author() {
+        for mode in [
+            LeaderSchedule::RoundRobin,
+            LeaderSchedule::StakeWeighted,
+            LeaderSchedule::RoundRobinSkipAbsent,
+            LeaderSchedule::StakeWeightedSkipAbsent,
+        ] {
+            assert!(!mode.counts_parent_author(), "{mode:?}");
+        }
+        assert!(LeaderSchedule::RoundRobinSkipAbsentParent.counts_parent_author());
+        assert!(LeaderSchedule::StakeWeightedSkipAbsentParent.counts_parent_author());
+    }
+
+    #[test]
+    fn with_parent_present_moves_only_the_skip_absent_modes() {
+        // What a host switches a chain to once its rule revision takes effect.
+        assert_eq!(
+            LeaderSchedule::RoundRobinSkipAbsent.with_parent_present(),
+            LeaderSchedule::RoundRobinSkipAbsentParent
+        );
+        assert_eq!(
+            LeaderSchedule::StakeWeightedSkipAbsent.with_parent_present(),
+            LeaderSchedule::StakeWeightedSkipAbsentParent
+        );
+        for mode in [
+            LeaderSchedule::RoundRobin,
+            LeaderSchedule::StakeWeighted,
+            LeaderSchedule::RoundRobinSkipAbsentParent,
+            LeaderSchedule::StakeWeightedSkipAbsentParent,
+        ] {
+            assert_eq!(mode.with_parent_present(), mode, "{mode:?}");
+        }
     }
 
     #[test]
