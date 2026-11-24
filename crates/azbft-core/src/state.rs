@@ -450,10 +450,12 @@ impl ConsensusCore {
             return Some(self.leader(round));
         }
         let parent = self.tree.get(&parent_qc.block_id)?;
-        Some(
-            self.vset
-                .leader_after(round, self.leader_mode, Some(&parent.parent_qc)),
-        )
+        Some(self.vset.leader_after(
+            round,
+            self.leader_mode,
+            Some(&parent.parent_qc),
+            Some(parent.author),
+        ))
     }
 
     /// The leader that must have authored proposal block `b`.
