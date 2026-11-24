@@ -862,4 +862,47 @@ mod tests {
             "{to_author} vs {to_signers}"
         );
     }
+
+    /// blockchain#174's dynamics over a run of rounds. Every block carries a QC that lacks
+    /// its own author's vote, which reached the quorum last. One hand-over at round `k`
+    /// (a timeout, a slow node) then makes each author the next round's base leader, which
+    /// that QC calls absent. Under the earlier schedule the whole schedule therefore stays
+    /// one place off for good; once the parent's author counts as present it is back at
+    /// once.
+    #[test]
+    fn parent_present_ends_the_self_sustaining_shift_of_blockchain_174() {
+        let v = vs(4);
+        let ids: Vec<NodeId> = v.members().iter().map(|m| m.node_id).collect();
+        let k = 9u64;
+        let run = |mode: LeaderSchedule| {
+            let mut authors = vec![v.leader(Round(0)), v.leader(Round(1))];
+            for r in 2..200u64 {
+                let author = if r == k {
+                    v.leader(Round(r + 1)) // the one hand-over
+                } else {
+                    let parent = authors[(r - 1) as usize];
+                    let signers: Vec<u8> = ids
+                        .iter()
+                        .filter(|id| **id != parent)
+                        .map(|id| id.0[0])
+                        .collect();
+                    v.leader_after(
+                        Round(r),
+                        mode,
+                        Some(&liveness(r - 1, &signers)),
+                        Some(parent),
+                    )
+                };
+                authors.push(author);
+            }
+            (k + 1..200)
+                .filter(|&r| authors[r as usize] != v.leader(Round(r)))
+                .count()
+        };
+        assert_eq!(
+            run(LeaderSchedule::RoundRobinSkipAbsent),
+            (k + 1..200).count()
+        );
+        assert_eq!(run(LeaderSchedule::RoundRobinSkipAbsentParent), 0);
+    }
 }

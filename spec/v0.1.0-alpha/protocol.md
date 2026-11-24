@@ -24,7 +24,8 @@ The leader schedule is a chain constant committed by genesis.
   the corresponding cumulative-stake bucket. It uses integer arithmetic only.
 - `round_robin_skip_absent` and `stake_weighted_skip_absent` (genesis values 2
   and 3) start from the base schedule above and move the rounds of validators
-  that are missing from the *liveness QC*.
+  that are missing from the *liveness QC*; their `_parent` forms (4 and 5) also
+  count the parent block's author as present (below).
 
 The liveness QC of a proposal at round `r` is the parent QC carried by the block
 the proposal extends (the grandparent certificate). Let `E` be the members of
@@ -47,6 +48,17 @@ liveness QC.
 
 A validator that signs QCs slowly can lose rounds under a skip-absent schedule,
 because a QC needs only a quorum and need not name every live validator.
+
+`round_robin_skip_absent_parent` and `stake_weighted_skip_absent_parent`
+(genesis values 4 and 5) are the skip-absent schedules with one change: when `E`
+is not empty, the author of the block the proposal extends is added to `E`. That
+author has just proposed, but its own vote on the block before usually reaches
+the quorum last, so the QC its block carries leaves it out. Counted absent, it
+lost every round it was the base leader of, and a single hand-over kept the
+whole schedule one place off. An empty `E` stays empty, so the schedule at
+genesis and at an epoch start is unchanged. A host may switch a chain from a
+skip-absent schedule to its `_parent` form at an epoch start that every
+validator agrees on; within an epoch the schedule does not change.
 
 Every validator in an epoch MUST use the same schedule and validator set.
 
